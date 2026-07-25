@@ -63,6 +63,7 @@ bind('btn-zoom-out', () => editor.zoomBy(1 / 1.2));
 bind('btn-zoom-in', () => editor.zoomBy(1.2));
 bind('btn-zoom-reset', () => editor.zoomReset());
 bind('btn-zoom-fit', () => editor.zoomFit());
+bind('btn-ortho', () => editor.toggleOrthoMode());
 bind('canvas-help', () => showShortcuts());
 
 function bind(id, fn) {
@@ -81,9 +82,12 @@ function showShortcuts() {
         label:
           'Strg+Z Rückgängig · Strg+Y/Shift+Strg+Z Wiederholen · Strg+S Speichern · ' +
           'Strg+O Öffnen · Strg+A Alles wählen · Strg+C/V Kopieren/Einfügen · ' +
-          'R Drehen · Entf Löschen · Leertaste+Ziehen Schwenken · Mausrad Zoom · Esc Abbrechen',
+          'R Drehen · Entf Löschen · O Ortho-Modus · ' +
+          'Leertaste+Ziehen Schwenken · Mausrad Zoom · Esc Abbrechen\n\n' +
+          'Ortho-Modus: Neue Kabel laufen nur waagrecht/senkrecht (L-Form). ' +
+          'Einzelne Kabelsegmente können durch Klicken und Ziehen verschoben werden.',
         type: 'textarea',
-        rows: 5,
+        rows: 6,
       },
     ],
   });

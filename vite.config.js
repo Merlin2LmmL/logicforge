@@ -10,14 +10,16 @@ import { defineConfig } from 'vite';
 const REPO_NAME = 'logicforge';
 
 export default defineConfig({
-  base: process.env.VITE_BASE || `/${REPO_NAME}/`,
+  // For Replit: serve at root. For GitHub Pages builds pass VITE_BASE=/<repo>/ externally.
+  base: process.env.VITE_BASE || '/',
   build: {
     outDir: 'dist',
     target: 'es2020',
     sourcemap: false,
   },
   server: {
-    port: 5173,
-    open: true,
+    port: 5000,
+    host: true,  // allow Replit proxy
+    open: false,
   },
 });

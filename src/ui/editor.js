@@ -9,7 +9,7 @@ import {
   serializeCircuit, deserializeCircuit, serializeComponent,
   importComponentFile, downloadTextFile, pickTextFile,
 } from '../core/fileformat.js';
-import { GRID, computeLayout, instanceBounds, pointInInstance, pointToSegDist, wirePath } from './layout.js';
+import { GRID, computeLayout, instanceBounds, pointInInstance, pointToSegDist, wirePath, pinWorldPos } from './layout.js';
 import { render, COLORS, worldToScreen, screenToWorld } from './renderer.js';
 import { showDialog, confirmDialog, toast } from './dialog.js';
 import { CATEGORY_ORDER } from '../components/index.js';
@@ -57,6 +57,7 @@ export class Editor {
     this.activeCategory = null;
     this.lastMouseWorld = { x: 0, y: 0 };
     this._buttonPressedId = null;
+    this.orthoMode = localStorage.getItem('logicforge:orthoMode') === '1';
 
     this._bindEvents();
     this._resizeObserver = new ResizeObserver(() => this._resizeCanvas());
@@ -64,6 +65,7 @@ export class Editor {
     this._resizeCanvas();
 
     this.pushHistory(); // initial empty state
+    this._updateOrthoButton();
     requestAnimationFrame((t) => this._frame(t));
   }
 
@@ -214,7 +216,12 @@ export class Editor {
       const path = wirePath(this.circuit, wire);
       if (!path) continue;
       for (let j = 0; j < path.length - 1; j++) {
-        if (pointToSegDist(wx, wy, path[j].x, path[j].y, path[j + 1].x, path[j + 1].y) <= threshold) return wire;
+        if (pointToSegDist(wx, wy, path[j].x, path[j].y, path[j + 1].x, path[j + 1].y) <= threshold) {
+          const dx = path[j + 1].x - path[j].x;
+          const dy = path[j + 1].y - path[j].y;
+          const segDir = Math.abs(dy) <= Math.abs(dx) ? 'h' : 'v';
+          return { wire, segIndex: j, segDir };
+        }
       }
     }
     return null;
@@ -314,12 +321,20 @@ export class Editor {
 
     const wireHit = this._findWireAt(wp.x, wp.y);
     if (wireHit) {
+      const { wire, segIndex, segDir } = wireHit;
       if (e.shiftKey) {
-        if (this.selection.has(wireHit.id)) this.selection.delete(wireHit.id); else this.selection.add(wireHit.id);
+        if (this.selection.has(wire.id)) this.selection.delete(wire.id); else this.selection.add(wire.id);
+        this.refreshPanels();
       } else {
-        this.selection = new Set([wireHit.id]);
+        if (!this.selection.has(wire.id)) { this.selection = new Set([wire.id]); this.refreshPanels(); }
+        // Start a potential segment drag; if user doesn't move enough it's just a click
+        this.drag = {
+          kind: 'wire-seg', wire, segIndex, segDir,
+          startScreen: sp, startWorld: wp, moved: false,
+          origPoints: wire.points.map((p) => ({ ...p })),
+        };
+        this.canvas.setPointerCapture(e.pointerId);
       }
-      this.refreshPanels();
       return;
     }
 
@@ -344,8 +359,29 @@ export class Editor {
         endX = hit.x; endY = hit.y;
         valid = this._pinsCompatible(this.wireDraft.startInst, this.wireDraft.startPin, hit.inst, hit.pin);
       }
-      this.wireDraft.points = [this.wireDraft.points[0], { x: endX, y: endY }];
+      const start = this.wireDraft.points[0];
+      if (this.orthoMode) {
+        const elbow = { x: endX, y: start.y };
+        this.wireDraft.points = [start, elbow, { x: endX, y: endY }];
+      } else {
+        this.wireDraft.points = [start, { x: endX, y: endY }];
+      }
       this.wireDraft.valid = valid;
+      return;
+    }
+
+    if (this.drag?.kind === 'wire-seg') {
+      const dxPx = sp.x - this.drag.startScreen.x, dyPx = sp.y - this.drag.startScreen.y;
+      if (!this.drag.moved && Math.hypot(dxPx, dyPx) > MOVE_THRESHOLD_PX) this.drag.moved = true;
+      if (this.drag.moved) {
+        const snap = this._snap(wp.x, wp.y);
+        const { wire, segIndex, segDir, origPoints } = this.drag;
+        const path = wirePath(this.circuit, wire);
+        if (path) {
+          const newCoord = segDir === 'h' ? snap.y : snap.x;
+          wire.points = this._computeDraggedPoints(origPoints, path[0], path[path.length - 1], segIndex, segDir, newCoord);
+        }
+      }
       return;
     }
 
@@ -397,6 +433,12 @@ export class Editor {
   }
 
   _onPointerUp(e) {
+    if (this.drag?.kind === 'wire-seg') {
+      if (this.drag.moved) this.pushHistory();
+      this.drag = null;
+      return;
+    }
+
     if (this.drag?.kind === 'pan') {
       this.canvas.classList.remove('mode-panning');
       this.drag = null;
@@ -469,11 +511,65 @@ export class Editor {
 
   _connect(instA, pinA, instB, pinB) {
     const [srcInst, srcPin, tgtInst, tgtPin] = pinA.dir === 'out' ? [instA, pinA, instB, pinB] : [instB, pinB, instA, pinA];
-    // an input can only have one driver - replace any existing wire into it
     const existing = this.circuit.wireInto(tgtInst.id, tgtPin.id);
     if (existing) this.circuit.removeWire(existing.id);
-    this.circuit.addWire(new Wire({ from: { compId: srcInst.id, pinId: srcPin.id }, to: { compId: tgtInst.id, pinId: tgtPin.id }, points: [] }));
+
+    let points = [];
+    if (this.orthoMode) {
+      const src = pinWorldPos(srcInst, srcPin.id);
+      const tgt = pinWorldPos(tgtInst, tgtPin.id);
+      if (src && tgt && (Math.abs(src.x - tgt.x) > 0.01 || Math.abs(src.y - tgt.y) > 0.01)) {
+        // L-shape: go horizontal first, then vertical
+        points = [{ x: tgt.x, y: src.y }];
+      }
+    }
+
+    this.circuit.addWire(new Wire({ from: { compId: srcInst.id, pinId: srcPin.id }, to: { compId: tgtInst.id, pinId: tgtPin.id }, points }));
     this.pushHistory();
+  }
+
+  // Recompute waypoints after dragging one segment.
+  // origPoints: wire.points snapshot at drag start
+  // pinStart/pinEnd: immovable pin world positions
+  // segIdx: index of the dragged segment in the FULL path [pinStart, ...origPoints, pinEnd]
+  // segDir: 'h' (horizontal segment, drag changes y) | 'v' (vertical, drag changes x)
+  // newCoord: snapped target coordinate (y for 'h', x for 'v')
+  _computeDraggedPoints(origPoints, pinStart, pinEnd, segIdx, segDir, newCoord) {
+    const path = [pinStart, ...origPoints.map((p) => ({ ...p })), pinEnd];
+    const n = path.length;
+    const coord = segDir === 'h' ? 'y' : 'x';
+    const otherCoord = segDir === 'h' ? 'x' : 'y';
+
+    const aPin = segIdx === 0;           // path[segIdx] is the immovable start pin
+    const bPin = segIdx + 1 === n - 1;  // path[segIdx+1] is the immovable end pin
+
+    // Move the movable endpoint(s) of the dragged segment
+    if (!aPin) path[segIdx][coord] = newCoord;
+    if (!bPin) path[segIdx + 1][coord] = newCoord;
+
+    // If the segment touches the start pin, insert a bridge waypoint so orthogonality holds
+    if (aPin) {
+      path.splice(1, 0, { [coord]: newCoord, [otherCoord]: path[0][otherCoord] });
+    }
+    // If the segment touches the end pin, insert a bridge waypoint before it
+    if (bPin) {
+      const last = path.length - 1; // recomputed after potential aPin insertion
+      path.splice(last, 0, { [coord]: newCoord, [otherCoord]: path[last][otherCoord] });
+    }
+
+    return path.slice(1, -1); // strip pin endpoints → only movable waypoints
+  }
+
+  toggleOrthoMode() {
+    this.orthoMode = !this.orthoMode;
+    localStorage.setItem('logicforge:orthoMode', this.orthoMode ? '1' : '0');
+    this._updateOrthoButton();
+    toast(this.orthoMode ? 'Ortho-Modus aktiv — Kabel laufen nur waagrecht/senkrecht' : 'Ortho-Modus deaktiviert', 'info');
+  }
+
+  _updateOrthoButton() {
+    const btn = document.getElementById('btn-ortho');
+    if (btn) btn.classList.toggle('active', this.orthoMode);
   }
 
   _onWheel(e) {
@@ -510,6 +606,7 @@ export class Editor {
     if (e.key === 'Escape') { this._setPlacing(null); this.wireDraft = null; this.selection = new Set(); this.refreshPanels(); return; }
     if (e.key === 'Delete' || e.key === 'Backspace') { this.deleteSelection(); return; }
     if (e.key.toLowerCase() === 'r') { this.rotateSelection(); return; }
+    if (e.key.toLowerCase() === 'o') { this.toggleOrthoMode(); return; }
   }
 
   _onKeyUp(e) {

@@ -1,4 +1,4 @@
-import { GRID, computeLayout, effectiveSize, wirePath, getDef } from './layout.js';
+import { GRID, computeLayout, effectiveSize, wirePath, getDef, pointToSegDist } from './layout.js';
 import { FLOATING, CONFLICT, toInt } from '../core/bits.js';
 
 export const COLORS = {
@@ -53,9 +53,16 @@ export function render(ctx, w, h, S) {
 
   drawGrid(ctx, camera, w, h);
 
-  // wires (draw before components so pins sit on top)
+  // Pre-compute wire paths for junction detection
+  const wirePaths = new Map();
   for (const wire of circuit.wires) {
     const path = wirePath(circuit, wire);
+    if (path) wirePaths.set(wire.id, path);
+  }
+
+  // wires (draw before components so pins sit on top)
+  for (const wire of circuit.wires) {
+    const path = wirePaths.get(wire.id);
     if (!path) continue;
     const bits = wireValues?.get(wire.id);
     const state = bitsState(bits);
@@ -63,6 +70,11 @@ export function render(ctx, w, h, S) {
     const width = bits && bits.length > 1 ? 3 : 2;
     drawWire(ctx, camera, path, state, selected, time, width, invalidWires?.has(wire.id));
   }
+
+  // Junction dots: wherever a source pin drives ≥2 wires (fan-out),
+  // and wherever a wire endpoint lands on another wire's interior (T-junction)
+  const junctions = computeJunctions(circuit, circuit.wires, wirePaths, wireValues);
+  for (const j of junctions) drawJunctionDot(ctx, camera, j);
 
   if (wireDraft) {
     drawWire(ctx, camera, wireDraft.points, wireDraft.valid ? 'low' : 'conflict', false, time, 2, false, true);
@@ -145,6 +157,64 @@ function drawWire(ctx, camera, points, state, selected, time, lineWidth, invalid
     tracePath(ctx, pts);
     ctx.stroke();
   }
+  ctx.restore();
+}
+
+// ---- junction dots ----
+
+function computeJunctions(circuit, wires, wirePaths, wireValues) {
+  // Fan-out: source pins with ≥2 wires leaving them get a dot
+  const fromCount = new Map();
+  for (const wire of wires) {
+    const key = `${wire.from.compId}|${wire.from.pinId}`;
+    if (!fromCount.has(key)) {
+      const path = wirePaths.get(wire.id);
+      fromCount.set(key, { pos: path ? path[0] : null, count: 0, wireId: wire.id });
+    }
+    fromCount.get(key).count++;
+  }
+  const junctions = [];
+  for (const { pos, count, wireId } of fromCount.values()) {
+    if (count >= 2 && pos) {
+      const bits = wireValues?.get(wireId);
+      junctions.push({ pos, bits });
+    }
+  }
+
+  // T-junction: a wire endpoint lies on the interior of another wire's segment
+  for (const wireA of wires) {
+    const pathA = wirePaths.get(wireA.id);
+    if (!pathA) continue;
+    const endPt = pathA[pathA.length - 1]; // target pin position
+    for (const wireB of wires) {
+      if (wireA.id === wireB.id) continue;
+      const pathB = wirePaths.get(wireB.id);
+      if (!pathB) continue;
+      for (let k = 0; k < pathB.length - 1; k++) {
+        const a = pathB[k], b = pathB[k + 1];
+        // Skip if endPt is at one of the segment's own endpoints
+        if (Math.hypot(endPt.x - a.x, endPt.y - a.y) < 0.05) continue;
+        if (Math.hypot(endPt.x - b.x, endPt.y - b.y) < 0.05) continue;
+        if (pointToSegDist(endPt.x, endPt.y, a.x, a.y, b.x, b.y) < 0.05) {
+          const bits = wireValues?.get(wireA.id);
+          junctions.push({ pos: endPt, bits });
+          break;
+        }
+      }
+    }
+  }
+
+  return junctions;
+}
+
+function drawJunctionDot(ctx, camera, { pos, bits }) {
+  const sp = worldToScreen(camera, pos.x, pos.y);
+  const state = bitsState(bits);
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(sp.x, sp.y, 4 * camera.zoom, 0, Math.PI * 2);
+  ctx.fillStyle = wireColor(state);
+  ctx.fill();
   ctx.restore();
 }
 
