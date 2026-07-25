@@ -1,0 +1,819 @@
+import { Circuit, ComponentInstance, Wire, nextId } from '../core/model.js';
+import { getComponentType, categorized, defaultParams } from '../core/registry.js';
+import { settleCircuit, resetCircuitState } from '../core/simulator.js';
+import {
+  listDefinitions, createCompositeDefinition, createCodeDefinition,
+  removeDefinition, persist,
+} from '../core/library.js';
+import {
+  serializeCircuit, deserializeCircuit, serializeComponent,
+  importComponentFile, downloadTextFile, pickTextFile,
+} from '../core/fileformat.js';
+import { GRID, computeLayout, instanceBounds, pointInInstance, pointToSegDist, wirePath } from './layout.js';
+import { render, COLORS, worldToScreen, screenToWorld } from './renderer.js';
+import { showDialog, confirmDialog, toast } from './dialog.js';
+import { CATEGORY_ORDER } from '../components/index.js';
+
+const AUTOSAVE_KEY = 'logicforge:autosave:v1';
+const PIN_HIT_PX = 9;
+const WIRE_HIT_PX = 6;
+const MOVE_THRESHOLD_PX = 4;
+const HISTORY_LIMIT = 100;
+
+const DEFAULT_CODE_TEMPLATE = `// inputs.A / inputs.B sind Bit-Arrays (LSB zuerst): 0, 1, null (offen) oder 'X' (Konflikt)
+// state ist dein eigener, dauerhafter Zustand (Startwert: {})
+// Rückgabe: { outputs: { Y: [bit, ...] }, state }
+
+const a = inputs.A ? inputs.A[0] : 0;
+const b = inputs.B ? inputs.B[0] : 0;
+return { outputs: { Y: [(a && b) ? 1 : 0] }, state };
+`;
+
+export class Editor {
+  constructor(dom) {
+    this.dom = dom;
+    this.canvas = dom.canvas;
+    this.ctx = this.canvas.getContext('2d');
+
+    this.circuit = new Circuit();
+    this.meta = { name: 'Unbenannte Schaltung', author: '', description: '' };
+
+    this.camera = { panX: 60, panY: 60, zoom: 1.2 };
+    this.selection = new Set();
+    this.hover = null;
+    this.wireDraft = null;
+    this.marquee = null;
+    this.placingType = null;
+    this.clipboard = null;
+    this.time = 0;
+    this.wireValues = new Map();
+    this.instanceOutputs = new Map();
+
+    this.history = [];
+    this.historyIndex = -1;
+
+    this.drag = null; // { kind: 'move'|'pan', ... }
+    this.keys = { space: false };
+    this.activeCategory = null;
+    this.lastMouseWorld = { x: 0, y: 0 };
+    this._buttonPressedId = null;
+
+    this._bindEvents();
+    this._resizeObserver = new ResizeObserver(() => this._resizeCanvas());
+    this._resizeObserver.observe(dom.canvasWrap);
+    this._resizeCanvas();
+
+    this.pushHistory(); // initial empty state
+    requestAnimationFrame((t) => this._frame(t));
+  }
+
+  // ---------------------------------------------------------------- setup
+
+  setCircuit(circuit, meta = {}) {
+    this.circuit = circuit;
+    this.meta = { name: meta.name || 'Unbenannte Schaltung', author: meta.author || '', description: meta.description || '' };
+    this.selection = new Set();
+    this.history = [];
+    this.historyIndex = -1;
+    this.pushHistory();
+    this.refreshPanels();
+  }
+
+  _resizeCanvas() {
+    const rect = this.dom.canvasWrap.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.canvas.width = Math.max(1, Math.round(rect.width * dpr));
+    this.canvas.height = Math.max(1, Math.round(rect.height * dpr));
+    this.canvas.style.width = rect.width + 'px';
+    this.canvas.style.height = rect.height + 'px';
+    this._dpr = dpr;
+    this._cssW = rect.width;
+    this._cssH = rect.height;
+  }
+
+  // ---------------------------------------------------------------- history
+
+  pushHistory() {
+    if (this.historyIndex < this.history.length - 1) {
+      this.history = this.history.slice(0, this.historyIndex + 1);
+    }
+    this.history.push(this.circuit.clone());
+    if (this.history.length > HISTORY_LIMIT) this.history.shift();
+    this.historyIndex = this.history.length - 1;
+    this._autosave();
+    this._updateHistoryButtons();
+  }
+
+  undo() {
+    if (this.historyIndex <= 0) return;
+    this.historyIndex--;
+    this.circuit = this.history[this.historyIndex].clone();
+    this.selection = new Set();
+    this._updateHistoryButtons();
+    this.refreshPanels();
+  }
+
+  redo() {
+    if (this.historyIndex >= this.history.length - 1) return;
+    this.historyIndex++;
+    this.circuit = this.history[this.historyIndex].clone();
+    this.selection = new Set();
+    this._updateHistoryButtons();
+    this.refreshPanels();
+  }
+
+  _updateHistoryButtons() {
+    this.dom.btnUndo.disabled = this.historyIndex <= 0;
+    this.dom.btnRedo.disabled = this.historyIndex >= this.history.length - 1;
+  }
+
+  _autosave() {
+    try {
+      localStorage.setItem(AUTOSAVE_KEY, serializeCircuit(this.circuit, this.meta));
+    } catch (e) { /* quota or private mode - ignore */ }
+  }
+
+  // ---------------------------------------------------------------- main loop
+
+  _frame(now) {
+    this.time = now;
+    const { wireValues, instanceOutputs } = settleCircuit(this.circuit, { now });
+    this.wireValues = wireValues;
+    this.instanceOutputs = instanceOutputs;
+    this._draw();
+    this._updateStatusBar();
+    requestAnimationFrame((t) => this._frame(t));
+  }
+
+  _draw() {
+    const ctx = this.ctx;
+    ctx.setTransform(this._dpr, 0, 0, this._dpr, 0, 0);
+    render(ctx, this._cssW, this._cssH, {
+      camera: this.camera,
+      circuit: this.circuit,
+      selection: this.selection,
+      wireValues: this.wireValues,
+      instanceOutputs: this.instanceOutputs,
+      hover: this.hover,
+      wireDraft: this.wireDraft,
+      marquee: this.marquee,
+      time: this.time,
+    });
+    if (this.placingType) this._drawGhost(ctx);
+  }
+
+  _drawGhost(ctx) {
+    const def = getComponentType(this.placingType);
+    if (!def) return;
+    const { x: gx, y: gy } = this._snap(this.lastMouseWorld.x, this.lastMouseWorld.y);
+    const { w, h } = def.size(defaultParams(def));
+    const tl = worldToScreen(this.camera, gx, gy);
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = 'rgba(94,234,212,0.08)';
+    ctx.strokeStyle = def.color || COLORS.teal;
+    ctx.setLineDash([4, 3]);
+    ctx.lineWidth = 1.4;
+    ctx.fillRect(tl.x, tl.y, w * GRID * this.camera.zoom, h * GRID * this.camera.zoom);
+    ctx.strokeRect(tl.x, tl.y, w * GRID * this.camera.zoom, h * GRID * this.camera.zoom);
+    ctx.restore();
+  }
+
+  _snap(x, y) { return { x: Math.round(x), y: Math.round(y) }; }
+
+  // ---------------------------------------------------------------- hit testing
+
+  _findPinAt(wx, wy) {
+    const threshold = PIN_HIT_PX / (GRID * this.camera.zoom);
+    for (let i = this.circuit.components.length - 1; i >= 0; i--) {
+      const inst = this.circuit.components[i];
+      const layout = computeLayout(inst);
+      for (const pin of layout.pins) {
+        const pos = layout.positions.get(pin.id);
+        const px = inst.x + pos.x, py = inst.y + pos.y;
+        if (Math.hypot(wx - px, wy - py) <= threshold) {
+          return { inst, pin, x: px, y: py };
+        }
+      }
+    }
+    return null;
+  }
+
+  _findComponentAt(wx, wy) {
+    for (let i = this.circuit.components.length - 1; i >= 0; i--) {
+      const inst = this.circuit.components[i];
+      if (pointInInstance(inst, wx, wy)) return inst;
+    }
+    return null;
+  }
+
+  _findWireAt(wx, wy) {
+    const threshold = WIRE_HIT_PX / (GRID * this.camera.zoom);
+    for (let i = this.circuit.wires.length - 1; i >= 0; i--) {
+      const wire = this.circuit.wires[i];
+      const path = wirePath(this.circuit, wire);
+      if (!path) continue;
+      for (let j = 0; j < path.length - 1; j++) {
+        if (pointToSegDist(wx, wy, path[j].x, path[j].y, path[j + 1].x, path[j + 1].y) <= threshold) return wire;
+      }
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------- events
+
+  _bindEvents() {
+    const c = this.canvas;
+    c.addEventListener('pointerdown', (e) => this._onPointerDown(e));
+    window.addEventListener('pointermove', (e) => this._onPointerMove(e));
+    window.addEventListener('pointerup', (e) => this._onPointerUp(e));
+    c.addEventListener('wheel', (e) => this._onWheel(e), { passive: false });
+    c.addEventListener('contextmenu', (e) => e.preventDefault());
+    c.addEventListener('dblclick', (e) => this._onDblClick(e));
+
+    window.addEventListener('keydown', (e) => this._onKeyDown(e));
+    window.addEventListener('keyup', (e) => this._onKeyUp(e));
+    window.addEventListener('beforeunload', () => this._autosave());
+  }
+
+  _screenPos(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  _onPointerDown(e) {
+    const sp = this._screenPos(e);
+    const wp = screenToWorld(this.camera, sp.x, sp.y);
+    this.lastMouseWorld = wp;
+
+    // middle-mouse or space-drag => pan
+    if (e.button === 1 || (e.button === 0 && this.keys.space)) {
+      this.drag = { kind: 'pan', lastX: sp.x, lastY: sp.y };
+      this.canvas.setPointerCapture(e.pointerId);
+      this.canvas.classList.add('mode-panning');
+      return;
+    }
+    if (e.button !== 0) return;
+
+    // placing a new component from the palette
+    if (this.placingType) {
+      const def = getComponentType(this.placingType);
+      if (def) {
+        const { x, y } = this._snap(wp.x, wp.y);
+        const inst = new ComponentInstance({ type: this.placingType, x, y, params: defaultParams(def), state: def.init ? def.init(defaultParams(def)) : {} });
+        this.circuit.addComponent(inst);
+        this.selection = new Set([inst.id]);
+        this.pushHistory();
+        this.refreshPanels();
+        if (!e.shiftKey) this._setPlacing(null);
+      }
+      return;
+    }
+
+    // pins first
+    const pinHit = this._findPinAt(wp.x, wp.y);
+    if (pinHit) {
+      this.wireDraft = {
+        startInst: pinHit.inst, startPin: pinHit.pin,
+        points: [{ x: pinHit.x, y: pinHit.y }, { x: wp.x, y: wp.y }],
+        valid: true,
+      };
+      this.canvas.classList.add('mode-wiring');
+      return;
+    }
+
+    const compHit = this._findComponentAt(wp.x, wp.y);
+    if (compHit) {
+      const def = getComponentType(compHit.type);
+      const alreadySelected = this.selection.has(compHit.id);
+      if (e.shiftKey) {
+        if (alreadySelected) this.selection.delete(compHit.id); else this.selection.add(compHit.id);
+        this.refreshPanels();
+        return;
+      }
+      if (!alreadySelected) {
+        this.selection = new Set([compHit.id]);
+        this.refreshPanels();
+      }
+      // interactive components: BUTTON fires immediately (press semantics)
+      if (def?.interactive && def.onPointerDown) {
+        compHit.state = def.onPointerDown(compHit.state, compHit.params || {});
+        this._buttonPressedId = compHit.id;
+      }
+      const startPositions = new Map();
+      for (const id of this.selection) {
+        const inst = this.circuit.getComponent(id);
+        if (inst) startPositions.set(id, { x: inst.x, y: inst.y });
+      }
+      this.drag = {
+        kind: 'move', startScreen: sp, startWorld: wp, moved: false,
+        startPositions, clickedInst: compHit, clickedDef: def,
+      };
+      return;
+    }
+
+    const wireHit = this._findWireAt(wp.x, wp.y);
+    if (wireHit) {
+      if (e.shiftKey) {
+        if (this.selection.has(wireHit.id)) this.selection.delete(wireHit.id); else this.selection.add(wireHit.id);
+      } else {
+        this.selection = new Set([wireHit.id]);
+      }
+      this.refreshPanels();
+      return;
+    }
+
+    // empty canvas: marquee selection
+    if (!e.shiftKey) { this.selection = new Set(); this.refreshPanels(); }
+    this.marquee = { x0: wp.x, y0: wp.y, x1: wp.x, y1: wp.y };
+    this.drag = { kind: 'marquee', additive: e.shiftKey };
+  }
+
+  _onPointerMove(e) {
+    const sp = this._screenPos(e);
+    const wp = screenToWorld(this.camera, sp.x, sp.y);
+    this.lastMouseWorld = wp;
+
+    if (this.placingType) { this._updateHint(); return; }
+
+    if (this.wireDraft) {
+      const hit = this._findPinAt(wp.x, wp.y);
+      let valid = true;
+      let endX = wp.x, endY = wp.y;
+      if (hit) {
+        endX = hit.x; endY = hit.y;
+        valid = this._pinsCompatible(this.wireDraft.startInst, this.wireDraft.startPin, hit.inst, hit.pin);
+      }
+      this.wireDraft.points = [this.wireDraft.points[0], { x: endX, y: endY }];
+      this.wireDraft.valid = valid;
+      return;
+    }
+
+    if (this.drag?.kind === 'pan') {
+      const dx = sp.x - this.drag.lastX, dy = sp.y - this.drag.lastY;
+      this.camera.panX += dx; this.camera.panY += dy;
+      this.drag.lastX = sp.x; this.drag.lastY = sp.y;
+      return;
+    }
+
+    if (this.drag?.kind === 'move') {
+      const dxPx = sp.x - this.drag.startScreen.x, dyPx = sp.y - this.drag.startScreen.y;
+      if (!this.drag.moved && Math.hypot(dxPx, dyPx) > MOVE_THRESHOLD_PX) this.drag.moved = true;
+      if (this.drag.moved) {
+        const dx = Math.round(wp.x - this.drag.startWorld.x);
+        const dy = Math.round(wp.y - this.drag.startWorld.y);
+        for (const [id, start] of this.drag.startPositions) {
+          const inst = this.circuit.getComponent(id);
+          if (inst) { inst.x = start.x + dx; inst.y = start.y + dy; }
+        }
+      }
+      return;
+    }
+
+    if (this.drag?.kind === 'marquee') {
+      this.marquee.x1 = wp.x; this.marquee.y1 = wp.y;
+      return;
+    }
+
+    // idle hover detection
+    const pinHit = this._findPinAt(wp.x, wp.y);
+    if (pinHit) {
+      const bits = pinHit.pin.dir === 'out'
+        ? this.instanceOutputs.get(pinHit.inst.id)?.[pinHit.pin.id]
+        : (() => { const w = this.circuit.wireInto(pinHit.inst.id, pinHit.pin.id); return w ? this.wireValues.get(w.id) : null; })();
+      this.hover = { type: 'pin', sp: worldToScreen(this.camera, pinHit.x, pinHit.y), bits, label: `${pinHit.inst.label || pinHit.inst.type}.${pinHit.pin.label || pinHit.pin.id}` };
+      this.canvas.style.cursor = 'crosshair';
+      return;
+    }
+    const compHit = this._findComponentAt(wp.x, wp.y);
+    if (compHit) {
+      this.hover = { type: 'component', id: compHit.id };
+      const def = getComponentType(compHit.type);
+      this.canvas.style.cursor = def?.interactive ? 'pointer' : 'move';
+      return;
+    }
+    this.hover = null;
+    this.canvas.style.cursor = this.keys.space ? 'grab' : 'default';
+  }
+
+  _onPointerUp(e) {
+    if (this.drag?.kind === 'pan') {
+      this.canvas.classList.remove('mode-panning');
+      this.drag = null;
+      return;
+    }
+
+    if (this.wireDraft) {
+      const sp = this._screenPos(e);
+      const wp = screenToWorld(this.camera, sp.x, sp.y);
+      const hit = this._findPinAt(wp.x, wp.y);
+      this.canvas.classList.remove('mode-wiring');
+      if (hit && this._pinsCompatible(this.wireDraft.startInst, this.wireDraft.startPin, hit.inst, hit.pin)) {
+        this._connect(this.wireDraft.startInst, this.wireDraft.startPin, hit.inst, hit.pin);
+      }
+      this.wireDraft = null;
+      return;
+    }
+
+    if (this.drag?.kind === 'move') {
+      const def = this.drag.clickedDef;
+      const inst = this.drag.clickedInst;
+      if (def?.onPointerUp && this._buttonPressedId === inst.id) {
+        inst.state = def.onPointerUp(inst.state, inst.params || {});
+      }
+      this._buttonPressedId = null;
+      if (!this.drag.moved && def?.interactive && def.onActivate) {
+        inst.state = def.onActivate(inst.state, inst.params || {});
+      }
+      if (this.drag.moved) this.pushHistory();
+      this.drag = null;
+      this.refreshPanels();
+      return;
+    }
+
+    if (this.drag?.kind === 'marquee') {
+      const m = this.marquee;
+      const x0 = Math.min(m.x0, m.x1), x1 = Math.max(m.x0, m.x1);
+      const y0 = Math.min(m.y0, m.y1), y1 = Math.max(m.y0, m.y1);
+      const picked = new Set(this.drag.additive ? this.selection : []);
+      for (const inst of this.circuit.components) {
+        const b = instanceBounds(inst);
+        if (b.x + b.w >= x0 && b.x <= x1 && b.y + b.h >= y0 && b.y <= y1) picked.add(inst.id);
+      }
+      for (const w of this.circuit.wires) {
+        const path = wirePath(this.circuit, w);
+        if (!path) continue;
+        if (path.some((p) => p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1)) picked.add(w.id);
+      }
+      this.selection = picked;
+      this.marquee = null;
+      this.drag = null;
+      this.refreshPanels();
+      return;
+    }
+
+    if (this._buttonPressedId) {
+      const inst = this.circuit.getComponent(this._buttonPressedId);
+      const def = inst && getComponentType(inst.type);
+      if (def?.onPointerUp) inst.state = def.onPointerUp(inst.state, inst.params || {});
+      this._buttonPressedId = null;
+    }
+  }
+
+  _pinsCompatible(instA, pinA, instB, pinB) {
+    if (instA.id === instB.id && pinA.id === pinB.id) return false;
+    if (pinA.dir === pinB.dir) return false;
+    if ((pinA.width ?? 1) !== (pinB.width ?? 1)) return false;
+    return true;
+  }
+
+  _connect(instA, pinA, instB, pinB) {
+    const [srcInst, srcPin, tgtInst, tgtPin] = pinA.dir === 'out' ? [instA, pinA, instB, pinB] : [instB, pinB, instA, pinA];
+    // an input can only have one driver - replace any existing wire into it
+    const existing = this.circuit.wireInto(tgtInst.id, tgtPin.id);
+    if (existing) this.circuit.removeWire(existing.id);
+    this.circuit.addWire(new Wire({ from: { compId: srcInst.id, pinId: srcPin.id }, to: { compId: tgtInst.id, pinId: tgtPin.id }, points: [] }));
+    this.pushHistory();
+  }
+
+  _onWheel(e) {
+    e.preventDefault();
+    const sp = this._screenPos(e);
+    const before = screenToWorld(this.camera, sp.x, sp.y);
+    const factor = Math.exp(-e.deltaY * 0.0012);
+    this.camera.zoom = Math.min(3, Math.max(0.25, this.camera.zoom * factor));
+    this.camera.panX = sp.x - before.x * GRID * this.camera.zoom;
+    this.camera.panY = sp.y - before.y * GRID * this.camera.zoom;
+  }
+
+  _onDblClick(e) {
+    const sp = this._screenPos(e);
+    const wp = screenToWorld(this.camera, sp.x, sp.y);
+    const inst = this._findComponentAt(wp.x, wp.y);
+    if (inst) this.dom.focusLabelField?.(inst.id);
+  }
+
+  _onKeyDown(e) {
+    const tag = document.activeElement?.tagName;
+    const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    if (e.code === 'Space' && !typing) { this.keys.space = true; this.canvas.classList.add('mode-pan'); }
+    if (typing) return;
+
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? this.redo() : this.undo(); return; }
+    if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); this.redo(); return; }
+    if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); this.saveToFile(); return; }
+    if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); this.openFromFile(); return; }
+    if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); this.selection = new Set([...this.circuit.components.map((c) => c.id), ...this.circuit.wires.map((w) => w.id)]); this.refreshPanels(); return; }
+    if (mod && e.key.toLowerCase() === 'c') { this.copySelection(); return; }
+    if (mod && e.key.toLowerCase() === 'v') { this.pasteClipboard(); return; }
+    if (e.key === 'Escape') { this._setPlacing(null); this.wireDraft = null; this.selection = new Set(); this.refreshPanels(); return; }
+    if (e.key === 'Delete' || e.key === 'Backspace') { this.deleteSelection(); return; }
+    if (e.key.toLowerCase() === 'r') { this.rotateSelection(); return; }
+  }
+
+  _onKeyUp(e) {
+    if (e.code === 'Space') { this.keys.space = false; this.canvas.classList.remove('mode-pan'); }
+  }
+
+  // ---------------------------------------------------------------- actions
+
+  deleteSelection() {
+    if (this.selection.size === 0) return;
+    for (const id of [...this.selection]) {
+      if (this.circuit.getComponent(id)) this.circuit.removeComponent(id);
+      else this.circuit.removeWire(id);
+    }
+    this.selection = new Set();
+    this.pushHistory();
+    this.refreshPanels();
+  }
+
+  rotateSelection() {
+    let any = false;
+    for (const id of this.selection) {
+      const inst = this.circuit.getComponent(id);
+      if (inst) { inst.rot = (inst.rot + 1) % 4; any = true; }
+    }
+    if (any) { this.pushHistory(); this.refreshPanels(); }
+  }
+
+  copySelection() {
+    const compIds = new Set([...this.selection].filter((id) => this.circuit.getComponent(id)));
+    if (!compIds.size) return;
+    const tmp = new Circuit();
+    for (const id of compIds) tmp.addComponent(this.circuit.getComponent(id).clone());
+    for (const w of this.circuit.wires) {
+      if (compIds.has(w.from.compId) && compIds.has(w.to.compId)) tmp.addWire(w.clone());
+    }
+    this.clipboard = JSON.parse(JSON.stringify(tmp.toPlain()));
+    toast(`${compIds.size} Bauteil(e) kopiert`, 'info');
+  }
+
+  pasteClipboard() {
+    if (!this.clipboard) return;
+    const idMap = new Map();
+    const newSel = new Set();
+    for (const c of this.clipboard.components) {
+      const newId = nextId('c');
+      idMap.set(c.id, newId);
+      const inst = new ComponentInstance({ ...c, id: newId, x: c.x + 2, y: c.y + 2 });
+      this.circuit.addComponent(inst);
+      newSel.add(newId);
+    }
+    for (const w of this.clipboard.wires) {
+      this.circuit.addWire(new Wire({
+        from: { compId: idMap.get(w.from.compId), pinId: w.from.pinId },
+        to: { compId: idMap.get(w.to.compId), pinId: w.to.pinId },
+        points: [],
+      }));
+    }
+    this.selection = newSel;
+    this.pushHistory();
+    this.refreshPanels();
+  }
+
+  resetSimulation() {
+    resetCircuitState(this.circuit);
+    toast('Simulationszustand zurückgesetzt', 'info');
+  }
+
+  _setPlacing(type) {
+    this.placingType = type;
+    this.canvas.classList.toggle('mode-placing', !!type);
+    this._updateHint();
+    this.dom.renderPalette();
+  }
+
+  _updateHint() {
+    const hintEl = this.dom.canvasHint;
+    if (this.placingType) {
+      const def = getComponentType(this.placingType);
+      hintEl.textContent = `Platziere „${def?.label || this.placingType}“ — Klick zum Setzen, weiter mit Shift, Esc zum Abbrechen`;
+      hintEl.classList.add('visible');
+    } else {
+      hintEl.classList.remove('visible');
+    }
+  }
+
+  // ---------------------------------------------------------------- view
+
+  zoomBy(factor) {
+    const cx = this._cssW / 2, cy = this._cssH / 2;
+    const before = screenToWorld(this.camera, cx, cy);
+    this.camera.zoom = Math.min(3, Math.max(0.25, this.camera.zoom * factor));
+    this.camera.panX = cx - before.x * GRID * this.camera.zoom;
+    this.camera.panY = cy - before.y * GRID * this.camera.zoom;
+  }
+
+  zoomReset() { this.camera.zoom = 1; }
+
+  zoomFit() {
+    if (this.circuit.components.length === 0) { this.camera = { panX: 60, panY: 60, zoom: 1.2 }; return; }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const inst of this.circuit.components) {
+      const b = instanceBounds(inst);
+      minX = Math.min(minX, b.x); minY = Math.min(minY, b.y);
+      maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h);
+    }
+    const pad = 3;
+    minX -= pad; minY -= pad; maxX += pad; maxY += pad;
+    const zoomX = this._cssW / ((maxX - minX) * GRID);
+    const zoomY = this._cssH / ((maxY - minY) * GRID);
+    this.camera.zoom = Math.min(2.5, Math.max(0.25, Math.min(zoomX, zoomY)));
+    this.camera.panX = -minX * GRID * this.camera.zoom + (this._cssW - (maxX - minX) * GRID * this.camera.zoom) / 2;
+    this.camera.panY = -minY * GRID * this.camera.zoom + (this._cssH - (maxY - minY) * GRID * this.camera.zoom) / 2;
+  }
+
+  // ---------------------------------------------------------------- file I/O
+
+  async newCircuit() {
+    if (this.circuit.components.length && !(await confirmDialog({ title: 'Neue Schaltung', message: 'Aktuelle Schaltung verwerfen und neu beginnen?' }))) return;
+    this.setCircuit(new Circuit(), { name: 'Unbenannte Schaltung' });
+    toast('Neue Schaltung angelegt', 'info');
+  }
+
+  saveToFile() {
+    const text = serializeCircuit(this.circuit, this.meta);
+    const filename = (this.meta.name || 'schaltung').replace(/[^\w\-]+/g, '_') + '.lgf';
+    downloadTextFile(filename, text);
+    toast(`Gespeichert als ${filename}`, 'success');
+  }
+
+  async openFromFile() {
+    try {
+      const { text, filename } = await pickTextFile();
+      const { circuit, meta } = deserializeCircuit(text);
+      this.setCircuit(circuit, meta);
+      toast(`„${filename}“ geladen`, 'success');
+    } catch (e) {
+      if (e?.message) toast('Öffnen fehlgeschlagen: ' + e.message, 'error');
+    }
+  }
+
+  async importComponent() {
+    try {
+      const { text } = await pickTextFile();
+      importComponentFile(text);
+      this.refreshPanels();
+      toast('Komponente importiert', 'success');
+    } catch (e) {
+      if (e?.message) toast('Import fehlgeschlagen: ' + e.message, 'error');
+    }
+  }
+
+  exportDefinition(defId, name) {
+    const text = serializeComponent(defId, { name });
+    downloadTextFile((name || 'komponente').replace(/[^\w\-]+/g, '_') + '.lgf', text);
+    toast(`„${name}“ exportiert`, 'success');
+  }
+
+  // ---------------------------------------------------------------- grouping into a component
+
+  async groupSelectionIntoComponent() {
+    const compIds = new Set([...this.selection].filter((id) => this.circuit.getComponent(id)));
+    if (compIds.size === 0) { toast('Keine Bauteile ausgewählt', 'error'); return; }
+
+    const sub = new Circuit();
+    const idMap = new Map();
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const id of compIds) {
+      const inst = this.circuit.getComponent(id);
+      const clone = inst.clone();
+      sub.addComponent(clone);
+      idMap.set(id, clone);
+      const b = instanceBounds(inst);
+      minX = Math.min(minX, b.x); minY = Math.min(minY, b.y);
+      maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h);
+    }
+    for (const w of this.circuit.wires) {
+      if (compIds.has(w.from.compId) && compIds.has(w.to.compId)) {
+        sub.addWire(new Wire({ from: { ...w.from }, to: { ...w.to }, points: w.points.map((p) => ({ ...p })) }));
+      }
+    }
+
+    let pinY = 0;
+    const outPinFor = new Map();
+    const inPinFor = new Map();
+    const outerRewires = [];
+
+    for (const w of this.circuit.wires) {
+      const fromIn = compIds.has(w.from.compId);
+      const toIn = compIds.has(w.to.compId);
+      if (fromIn === toIn) continue; // internal (handled above) or unrelated
+
+      if (fromIn) {
+        const key = `${w.from.compId}|${w.from.pinId}`;
+        let pinOut = outPinFor.get(key);
+        if (!pinOut) {
+          const srcInst = idMap.get(w.from.compId);
+          const srcDef = getComponentType(srcInst.type);
+          const srcPin = srcDef.pins(srcInst.params || {}).find((p) => p.id === w.from.pinId);
+          pinOut = new ComponentInstance({ type: 'PIN_OUT', x: maxX + 2, y: minY + pinY, params: { name: srcPin?.label || 'OUT', width: srcPin?.width ?? 1 } });
+          pinY += 2;
+          sub.addComponent(pinOut);
+          sub.addWire(new Wire({ from: { ...w.from }, to: { compId: pinOut.id, pinId: 'in0' }, points: [] }));
+          outPinFor.set(key, pinOut);
+        }
+        outerRewires.push({ from: { compId: '__NEW__', pinId: pinOut.id }, to: { ...w.to } });
+      } else {
+        const key = `${w.to.compId}|${w.to.pinId}`;
+        let pinIn = inPinFor.get(key);
+        if (!pinIn) {
+          const tgtInst = idMap.get(w.to.compId);
+          const tgtDef = getComponentType(tgtInst.type);
+          const tgtPin = tgtDef.pins(tgtInst.params || {}).find((p) => p.id === w.to.pinId);
+          pinIn = new ComponentInstance({ type: 'PIN_IN', x: minX - 4, y: minY + pinY, params: { name: tgtPin?.label || 'IN', width: tgtPin?.width ?? 1 } });
+          pinY += 2;
+          sub.addComponent(pinIn);
+          sub.addWire(new Wire({ from: { compId: pinIn.id, pinId: 'out' }, to: { ...w.to }, points: [] }));
+          inPinFor.set(key, pinIn);
+        }
+        outerRewires.push({ from: { ...w.from }, to: { compId: '__NEW__', pinId: pinIn.id } });
+      }
+    }
+
+    const meta = await showDialog({
+      title: 'Zu Komponente zusammenfassen',
+      fields: [
+        { key: 'name', label: 'Name', type: 'text', value: 'MeineKomponente' },
+        { key: 'category', label: 'Kategorie', type: 'text', value: 'Meine Komponenten' },
+        { key: 'color', label: 'Farbe', type: 'color', value: '#5eead4' },
+      ],
+      submitLabel: 'Erstellen',
+    });
+    if (!meta || !meta.name.trim()) return;
+
+    const def = createCompositeDefinition({ name: meta.name.trim(), category: meta.category.trim() || 'Meine Komponenten', color: meta.color, circuit: sub });
+
+    for (const id of compIds) this.circuit.removeComponent(id);
+    const newInst = new ComponentInstance({ type: def.id, x: Math.round((minX + maxX) / 2 - 2.5), y: Math.round((minY + maxY) / 2 - 2) });
+    this.circuit.addComponent(newInst);
+    for (const rw of outerRewires) {
+      const from = rw.from.compId === '__NEW__' ? { compId: newInst.id, pinId: rw.from.pinId } : rw.from;
+      const to = rw.to.compId === '__NEW__' ? { compId: newInst.id, pinId: rw.to.pinId } : rw.to;
+      this.circuit.addWire(new Wire({ from, to, points: [] }));
+    }
+
+    this.selection = new Set([newInst.id]);
+    this.pushHistory();
+    this.refreshPanels();
+    toast(`Komponente „${meta.name}“ erstellt (${def.pins.length} Pins)`, 'success');
+  }
+
+  async createCodeComponentDialog() {
+    const meta = await showDialog({
+      title: 'Code-Komponente erstellen',
+      wide: true,
+      fields: [
+        { key: 'name', label: 'Name', type: 'text', value: 'MeinBaustein' },
+        { key: 'category', label: 'Kategorie', type: 'text', value: 'Meine Komponenten (Code)' },
+        { key: 'color', label: 'Farbe', type: 'color', value: '#c084fc' },
+        { key: 'pins', label: 'Pins — ein Pin pro Zeile: name,in|out,breite', type: 'textarea', rows: 4, value: 'A,in,1\nB,in,1\nY,out,1' },
+        { key: 'code', label: 'JavaScript (inputs, state, params, helpers)', type: 'textarea', rows: 12, value: DEFAULT_CODE_TEMPLATE },
+      ],
+      submitLabel: 'Erstellen',
+    });
+    if (!meta || !meta.name.trim()) return;
+
+    const pins = meta.pins.split('\n').map((l) => l.trim()).filter(Boolean).map((line, i) => {
+      const [rawName, rawDir, rawWidth] = line.split(',').map((s) => (s || '').trim());
+      const dir = rawDir === 'out' ? 'out' : 'in';
+      return { id: (rawName || `p${i}`).replace(/[^\w]+/g, '_'), label: rawName || `P${i}`, dir, width: Math.max(1, parseInt(rawWidth, 10) || 1), order: i };
+    });
+    if (!pins.length || !pins.some((p) => p.dir === 'out')) {
+      toast('Mindestens ein Ausgang (out) wird benötigt', 'error');
+      return;
+    }
+
+    createCodeDefinition({ name: meta.name.trim(), category: meta.category.trim() || 'Meine Komponenten (Code)', color: meta.color, code: meta.code, pins });
+    this.refreshPanels();
+    toast(`Code-Komponente „${meta.name}“ erstellt`, 'success');
+  }
+
+  async deleteDefinition(defId, name) {
+    const ok = await confirmDialog({ title: 'Komponente löschen', message: `„${name}“ endgültig aus der Bibliothek löschen? Platzierte Instanzen bleiben als fehlender Typ erhalten.`, danger: true });
+    if (!ok) return;
+    removeDefinition(defId);
+    this.refreshPanels();
+    toast(`„${name}“ gelöscht`, 'info');
+  }
+
+  // ---------------------------------------------------------------- panel refresh (wired up from main.js)
+
+  refreshPanels() {
+    this.dom.renderPalette();
+    this.dom.renderProperties();
+    this.dom.renderLibrary();
+    this._updateHistoryButtons();
+  }
+
+  _updateStatusBar() {
+    const d = this.dom;
+    d.statusZoom.textContent = Math.round(this.camera.zoom * 100) + '%';
+    d.statusCoords.textContent = `x ${Math.round(this.lastMouseWorld.x)}, y ${Math.round(this.lastMouseWorld.y)}`;
+    d.statusSelection.textContent = `${this.selection.size} ausgewählt`;
+  }
+}
+
+export { CATEGORY_ORDER, categorized, listDefinitions };

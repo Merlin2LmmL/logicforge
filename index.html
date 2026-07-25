@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>LogicForge — Digitale Schaltkreise entwerfen &amp; simulieren</title>
+  <meta name="description" content="LogicForge: ein browserbasierter Editor für digitale Logikschaltungen. Gatter verdrahten, zu wiederverwendbaren Komponenten zusammenfassen und bis hin zu einer eigenen CPU bauen." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230a0e14'/%3E%3Cpath d='M6 12h3M15 12h3M12 6v3M12 15v3' stroke='%235eead4' stroke-width='1.6' stroke-linecap='round'/%3E%3Crect x='9' y='9' width='6' height='6' rx='1' fill='none' stroke='%23ffb454' stroke-width='1.6'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div id="app">
+    <header class="toolbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="20" height="20">
+            <rect x="8" y="8" width="8" height="8" rx="1" fill="none" stroke="#ffb454" stroke-width="1.6"/>
+            <path d="M4 12h4M16 12h4M12 4v4M12 16v4" stroke="#5eead4" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <span class="brand-name">Logic<b>Forge</b></span>
+      </div>
+
+      <div class="toolbar-group" data-group="file">
+        <button id="btn-new" class="tbtn" title="Neue Schaltung (Ctrl+Alt+N)">Neu</button>
+        <button id="btn-open" class="tbtn" title="Schaltung öffnen (Ctrl+O)">Öffnen</button>
+        <button id="btn-save" class="tbtn" title="Schaltung speichern (Ctrl+S)">Speichern</button>
+        <button id="btn-import-component" class="tbtn" title="Komponente importieren (.lgf)">Komponente&nbsp;importieren</button>
+      </div>
+
+      <div class="toolbar-sep"></div>
+
+      <div class="toolbar-group" data-group="edit">
+        <button id="btn-undo" class="tbtn icon" title="Rückgängig (Ctrl+Z)">↶</button>
+        <button id="btn-redo" class="tbtn icon" title="Wiederholen (Ctrl+Y)">↷</button>
+        <button id="btn-rotate" class="tbtn icon" title="Drehen (R)">⟳</button>
+        <button id="btn-delete" class="tbtn icon danger" title="Löschen (Entf)">✕</button>
+      </div>
+
+      <div class="toolbar-sep"></div>
+
+      <div class="toolbar-group" data-group="build">
+        <button id="btn-group" class="tbtn accent" title="Auswahl zu Komponente zusammenfassen">Zu&nbsp;Komponente&nbsp;machen</button>
+        <button id="btn-code-component" class="tbtn accent-alt" title="Neue Code-Komponente erstellen">Code-Komponente</button>
+        <button id="btn-reset-sim" class="tbtn" title="Simulationszustand zurücksetzen">Reset</button>
+      </div>
+
+      <div class="toolbar-sep"></div>
+
+      <div class="toolbar-group" data-group="view">
+        <button id="btn-zoom-out" class="tbtn icon" title="Verkleinern">–</button>
+        <button id="btn-zoom-reset" class="tbtn" title="Zoom 100%">100%</button>
+        <button id="btn-zoom-in" class="tbtn icon" title="Vergrößern">+</button>
+        <button id="btn-zoom-fit" class="tbtn" title="Auf Inhalt einpassen">Einpassen</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar sidebar-left" id="palette">
+        <div class="sidebar-header">Bauteile</div>
+        <div class="palette-tabs" id="palette-tabs"></div>
+        <div class="sidebar-body" id="palette-body"></div>
+      </aside>
+
+      <div class="canvas-wrap" id="canvas-wrap">
+        <canvas id="stage"></canvas>
+        <div class="canvas-hint" id="canvas-hint"></div>
+        <div class="canvas-help" id="canvas-help" title="Tastenkürzel anzeigen">?</div>
+      </div>
+
+      <aside class="sidebar sidebar-right">
+        <div class="sidebar-header">Eigenschaften</div>
+        <div class="sidebar-body" id="properties-body"></div>
+        <div class="sidebar-header sidebar-header-sep">Meine Komponenten</div>
+        <div class="sidebar-body sidebar-body-grow" id="library-body"></div>
+      </aside>
+    </main>
+
+    <footer class="statusbar">
+      <span id="status-hint">Bereit.</span>
+      <span class="spacer"></span>
+      <span id="status-selection">0 ausgewählt</span>
+      <span id="status-coords">x 0, y 0</span>
+      <span id="status-zoom">100%</span>
+    </footer>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

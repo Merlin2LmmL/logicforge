@@ -1,0 +1,17 @@
+{
+  "name": "logicforge",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "LogicForge – browserbasierter Editor für digitale Logikschaltungen",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "vite build && gh-pages -d dist"
+  },
+  "devDependencies": {
+    "vite": "^5.4.10",
+    "gh-pages": "^6.1.1"
+  }
+}
