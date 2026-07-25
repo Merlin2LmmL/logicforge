@@ -19,7 +19,8 @@ export default defineConfig({
   },
   server: {
     port: 5000,
-    host: true,  // allow Replit proxy
+    host: true,
+    allowedHosts: true,  // allow Replit proxy domains
     open: false,
   },
 });
