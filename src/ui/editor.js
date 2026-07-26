@@ -90,7 +90,12 @@ export class Editor {
     // Ergebnis verhält sich also wie ein "echter" schneller Taktgeber.
     this.simTime = 0;
     this.simStepMs = 0.001;      // Auflösung eines Sub-Schritts: 1 µs
-    this.simSpeed = 1000;        // "virtuelle ms Simulationszeit" pro 1ms Echtzeit (1000 = 1000x)
+    // "virtuelle ms Simulationszeit" pro 1ms Echtzeit. 1 = Echtzeit, d.h. eine auf 1 Hz
+    // konfigurierte Clock tickt auch wirklich 1x pro Sekunde Wanduhrzeit. War hier auf
+    // 1000 (1000x) fest verdrahtet, wodurch JEDE Clock unabhängig von ihrem Hz-Parameter
+    // permanent mit dem 1000-fachen ihrer eingestellten Frequenz lief. setSimSpeed() bleibt
+    // für einen künftigen "Zeitraffer"-Regler nutzbar, der Default muss aber Echtzeit sein.
+    this.simSpeed = 1;
     this.maxSubStepsPerFrame = 20000; // Deckel, damit ein extrem hoher Takt die UI nicht einfriert
     this._lastFrameNow = null;
 

@@ -5,6 +5,7 @@
 import './components/index.js'; // Seiteneffekt: registriert alle eingebauten Bauteiltypen
 import './style.css';
 import { Editor, CATEGORY_ORDER, categorized, listDefinitions } from './ui/editor.js';
+import { initResizablePanels } from './ui/panels.js';
 import { getComponentType } from './core/registry.js';
 import { loadFromStorage } from './core/library.js';
 import { deserializeCircuit } from './core/fileformat.js';
@@ -30,6 +31,12 @@ const AUTOSAVE_KEY = 'logicforge:autosave:v1';
 // 1) gespeicherte "Meine Komponenten" (aus vorherigen Sitzungen) laden,
 //    BEVOR die Palette zum ersten Mal gerendert wird.
 loadFromStorage();
+
+// 1b) gespeicherte Panel-Breiten/Eingeklappt-Status wiederherstellen, BEVOR der Editor
+//     angelegt wird - der misst #canvas-wrap sofort beim Start, und soll dabei schon die
+//     endgültige (wiederhergestellte) Breite sehen statt kurz die Default-Breite und dann
+//     einen sichtbaren Sprung.
+initResizablePanels();
 
 // ---------------------------------------------------------------- DOM refs
 

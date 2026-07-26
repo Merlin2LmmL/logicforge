@@ -95,19 +95,80 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
 /* ---------- workspace ---------- */
 
 .workspace {
-  display: grid;
-  grid-template-columns: 220px 1fr 260px;
+  display: flex;
   min-height: 0;
+  /* .workspace is itself a grid item of #app. Grid (and flex) items default to
+     min-width: auto, i.e. their automatic minimum size is clamped to their content's
+     max-content size instead of 0. Since the sidebars inside are flex-shrink:0 (by
+     design - they should hold their set width, not get squeezed by the canvas), that
+     max-content size includes both sidebars at their full current width. Without this
+     override the #app grid track is allowed to grow to fit that width instead of
+     clamping to the viewport, so widening a sidebar (via drag) and then collapsing +
+     reopening it re-triggers layout at that wider size and pushes the whole page past
+     the viewport width, forcing horizontal scrolling to reach the reopened panel. */
+  min-width: 0;
 }
 
 .sidebar {
   background: var(--panel);
-  border-right: 1px solid var(--border-soft);
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
+  flex: 0 0 auto;
+  overflow: hidden; /* clips content while width animates down to 0 on collapse */
 }
-.sidebar-right { border-right: none; border-left: 1px solid var(--border-soft); }
+.sidebar-left {
+  width: var(--sidebar-left-width, 220px);
+  border-right: 1px solid var(--border-soft);
+  transition: width 0.16s ease;
+}
+.sidebar-right {
+  width: var(--sidebar-right-width, 260px);
+  border-left: 1px solid var(--border-soft);
+  transition: width 0.16s ease;
+}
+.workspace.dragging-left .sidebar-left,
+.workspace.dragging-right .sidebar-right {
+  transition: none; /* no lag behind the pointer while actively dragging */
+}
+
+/* thin always-visible strip between a sidebar and the canvas: doubles as a drag handle
+   (resize) and carries the small collapse/expand toggle button, so the toggle stays
+   reachable even once its sidebar has collapsed down to 0 width. */
+.sidebar-handle {
+  flex: 0 0 6px;
+  width: 6px;
+  position: relative;
+  background: var(--border-soft);
+  cursor: col-resize;
+  z-index: 3;
+}
+.sidebar-handle:hover, .sidebar-handle.dragging { background: var(--teal); }
+.sidebar-handle.collapsed { cursor: default; }
+
+.sidebar-toggle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 16px;
+  height: 36px;
+  border-radius: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.sidebar-toggle:hover { color: var(--teal); border-color: var(--teal); }
+
+
 
 .sidebar-header {
   padding: 10px 12px 8px;
@@ -244,6 +305,7 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
 
 .canvas-wrap {
   position: relative;
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   background: var(--bg);
@@ -396,6 +458,5 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
 /* ---------- responsive ---------- */
 
 @media (max-width: 900px) {
-  .workspace { grid-template-columns: 0 1fr 0; }
-  .sidebar-left, .sidebar-right { display: none; }
+  .sidebar-left, .sidebar-right, .sidebar-handle { display: none; }
 }
