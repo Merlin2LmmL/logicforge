@@ -59,6 +59,44 @@ function circuitHasActiveClock(components, seenTypes = new Set()) {
   return false;
 }
 
+// Sammelt Periode und Pulsdauer jeder aktiven (hz>0) Clock in der Schaltung (rekursiv wie
+// circuitHasActiveClock), damit die Sub-Schritt-Auflösung sich an die tatsächlich
+// vorhandenen Taktfrequenzen anpassen kann, statt immer eine feste, sehr feine Schrittweite
+// zu erzwingen. Ohne das würde selbst eine einzelne 1-Hz-Clock mit derselben ~1µs-Auflösung
+// simuliert wie ein 1-MHz-Takt: ~16000 volle settleCircuit()-Durchläufe (je mit bis zu 48
+// internen Iterationen) PRO BILDSCHIRM-FRAME, obwohl ein 1-Hz-Takt pro Frame vielleicht 1-2
+// Auswertungen bräuchte. Das sprengte routinemäßig das Zeitbudget in _frame(), wodurch die
+// Simulation dauerhaft hinter der Wanduhr zurückblieb (eine 1-Hz-Clock blinkte dadurch z.B.
+// nur alle paar Sekunden statt jede Sekunde) - UND weil dabei trotzdem in tausenden winzigen
+// 1µs-Schritten durch ein einzelnes, sehr viel breiteres "sichtbares Blinken" (z.B. eine
+// 1ms-Pulsdauer) hindurchgetreten wurde, bekamen nachgeschaltete Bauteile (Zähler etc.) für
+// ein einziges Blinken tausende separate settleCircuit()-Aufrufe zu sehen statt einer
+// einzelnen sauberen Flanke.
+function collectActiveClockFeatures(components, seenTypes = new Set(), out = []) {
+  for (const inst of components) {
+    const def = getComponentType(inst.type);
+    if (!def) continue;
+    if (def.isClock) {
+      const hz = inst.params?.hz ?? 0;
+      if (hz > 0) {
+        const period = 1000 / hz;
+        const pulse = Math.min(inst.params?.pulseMs > 0 ? inst.params.pulseMs : period / 2, period);
+        out.push(pulse, Math.max(period - pulse, 0.000001));
+      }
+      continue;
+    }
+    if (def.isComposite) {
+      if (seenTypes.has(inst.type)) continue;
+      seenTypes.add(inst.type);
+      const libDef = getDefinition(inst.type);
+      if (libDef?.kind === 'composite' && libDef.circuit?.components?.length) {
+        collectActiveClockFeatures(libDef.circuit.components, seenTypes, out);
+      }
+    }
+  }
+  return out;
+}
+
 export class Editor {
   constructor(dom) {
     this.dom = dom;
@@ -89,7 +127,11 @@ export class Editor {
     // Speicher, Bildschirm-Framebuffer, ...) akkumuliert aber über alle Sub-Schritte, das
     // Ergebnis verhält sich also wie ein "echter" schneller Taktgeber.
     this.simTime = 0;
-    this.simStepMs = 0.001;      // Auflösung eines Sub-Schritts: 1 µs
+    // Absolute Untergrenze der Sub-Schritt-Auflösung (Sicherheitsfloor) - der tatsächlich
+    // verwendete Schritt wird pro Frame adaptiv aus den vorhandenen Clock-Frequenzen
+    // bestimmt (siehe collectActiveClockFeatures/_frame), 0.00025ms (250ns) reicht, um auch
+    // einen 1-MHz-Takt (Periode 1µs) mit ausreichend Samples pro Halbzyklus aufzulösen.
+    this.simStepMs = 0.00025;
     // "virtuelle ms Simulationszeit" pro 1ms Echtzeit. 1 = Echtzeit, d.h. eine auf 1 Hz
     // konfigurierte Clock tickt auch wirklich 1x pro Sekunde Wanduhrzeit. War hier auf
     // 1000 (1000x) fest verdrahtet, wodurch JEDE Clock unabhängig von ihrem Hz-Parameter
@@ -97,6 +139,15 @@ export class Editor {
     // für einen künftigen "Zeitraffer"-Regler nutzbar, der Default muss aber Echtzeit sein.
     this.simSpeed = 1;
     this.maxSubStepsPerFrame = 20000; // Deckel, damit ein extrem hoher Takt die UI nicht einfriert
+    // Virtuelle Simulationszeit, die in einem Frame nicht mehr verarbeitet werden konnte
+    // (Zeitbudget aufgebraucht), wird hierin für den nächsten Frame vorgemerkt statt
+    // stillschweigend verworfen zu werden - sonst würde die Simulation unter Dauerlast
+    // (z.B. eine sehr hochfrequente Clock in einer großen Schaltung) nie wieder zur
+    // Echtzeit aufschließen, sondern dauerhaft mit einer beliebigen, last-abhängigen
+    // Geschwindigkeit weiterlaufen. Nach oben gedeckelt, damit ein langer Tab-Hintergrund-
+    // Stillstand nicht zu einem stundenlangen "Nachsimulieren" in Zeitraffer führt.
+    this._simDebtMs = 0;
+    this._maxSimDebtMs = 1000;
     this._lastFrameNow = null;
 
     this.history = [];
@@ -237,9 +288,30 @@ export class Editor {
     } else {
       // Es gibt (mindestens) einen echten, laufenden Taktgeber - dessen Impulse dürfen
       // nicht "verschluckt" werden, auch wenn er viel schneller tickt als der Bildschirm
-      // Frames liefert. Dafür weiterhin feine Sub-Schritte in virtueller Zeit.
-      const simDeltaMs = realDeltaMs * this.simSpeed;
-      const stepMs = Math.max(this.simStepMs, simDeltaMs / this.maxSubStepsPerFrame);
+      // Frames liefert. Dafür weiterhin Sub-Schritte in virtueller Zeit, aber mit einer
+      // an die tatsächlich vorhandenen Taktfrequenzen ANGEPASSTEN Schrittweite statt einer
+      // fest verdrahteten 1µs-Auflösung: eine einzelne 1-Hz-Clock braucht pro Frame vielleicht
+      // 1-2 Auswertungen, kein 1µs-Rasterung über die vollen ~16ms - genau das zwang vorher
+      // JEDE aktive Clock (egal wie langsam) auf ~16000 volle settleCircuit()-Durchläufe pro
+      // Frame, was das Zeitbudget unten sprengte und die Simulation dauerhaft hinter der
+      // Wanduhr zurückfallen ließ (eine 1-Hz-Clock blinkte dadurch nur noch alle paar
+      // Sekunden), UND weil dabei trotzdem in winzigen Schritten durch ein einzelnes,
+      // deutlich breiteres Blinken (z.B. 1ms Pulsdauer) hindurchgetreten wurde, sah alles
+      // Nachgeschaltete (Zähler etc.) für ein sichtbares Blinken tausende separate
+      // settleCircuit()-Aufrufe statt einer einzelnen sauberen Flanke.
+      const features = collectActiveClockFeatures(this.circuit.components);
+      // Obergrenze für die Schrittweite: höchstens halb so breit wie das schmalste
+      // vorhandene Feature (Puls oder Gegen-Puls), damit auch der schmalste Puls
+      // garantiert mindestens einmal getroffen wird, egal wie niedrig die Grundfrequenz ist.
+      const neededRes = features.length ? Math.min(...features) / 2 : this.simStepMs;
+      // Untergrenze für die Schrittweite: genug, um den maxSubStepsPerFrame-Deckel
+      // einzuhalten, falls neededRes bei hoher Taktfrequenz + großem simDeltaMs (z.B. nach
+      // einer Zeitbudget-Unterbrechung im vorigen Frame) zu viele Schritte verlangen würde -
+      // in dem Fall wird die Auflösung kontrolliert vergröbert (graceful degradation) statt
+      // die Schleife beliebig lang laufen zu lassen.
+      const simDeltaMs = realDeltaMs * this.simSpeed + this._simDebtMs;
+      const capStep = simDeltaMs / this.maxSubStepsPerFrame;
+      const stepMs = Math.max(this.simStepMs, neededRes, capStep);
       let remaining = simDeltaMs;
       wireValues = this.wireValues;
       instanceOutputs = this.instanceOutputs;
@@ -247,18 +319,28 @@ export class Editor {
       // Zeitbudget als Sicherheitsnetz: auch mit einem echten (u.U. sehr hochfrequenten)
       // Takt darf ein einzelner Frame nicht beliebig lange rechnen, sonst friert bei einer
       // großen Schaltung + hoher Taktfrequenz trotzdem die UI ein. Wird das Budget
-      // aufgebraucht, bricht die Schleife ab; die virtuelle Simulationszeit bleibt für
-      // diesen Frame dann etwas hinter der (skalierten) Wanduhr zurück, statt dass das UI
-      // blockiert - der nächste Frame setzt einfach dort fort, wo dieser aufgehört hat.
+      // aufgebraucht, bricht die Schleife ab; die noch nicht verarbeitete virtuelle Zeit
+      // wird als `_simDebtMs` für den nächsten Frame vorgemerkt statt verworfen, damit die
+      // Simulation über mehrere Frames hinweg wieder zur Echtzeit aufschließt statt
+      // dauerhaft mit reduzierter Geschwindigkeit weiterzulaufen.
       const budgetDeadline = performance.now() + 8;
       let iters = 0;
       while (remaining > 0) {
-        this.simTime += stepMs;
-        remaining -= stepMs;
+        // Der letzte Schritt eines Frames wird auf `remaining` gekappt: stepMs kann bei
+        // einer niederfrequenten Clock (großes neededRes, z.B. 250ms bei einer 1-Hz-Clock
+        // mit 50% Tastgrad) durchaus größer sein als das, was diesen Frame an virtueller
+        // Zeit tatsächlich "zusteht" (simDeltaMs, typischerweise ~16ms) - ohne diese
+        // Kappung würde simTime in einem einzigen Sprung weiter vorrücken, als seit dem
+        // letzten Frame real Zeit vergangen ist, und die Clock liefe zu schnell statt zu
+        // langsam.
+        const s = Math.min(stepMs, remaining);
+        this.simTime += s;
+        remaining -= s;
         ({ wireValues, instanceOutputs } = settleCircuit(this.circuit, { now: this.simTime }));
         iters++;
         if ((iters & 63) === 0 && performance.now() > budgetDeadline) break;
       }
+      this._simDebtMs = Math.min(Math.max(remaining, 0), this._maxSimDebtMs);
     }
 
     this.wireValues = wireValues;
