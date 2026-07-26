@@ -1,3 +1,0 @@
-Bugfixes:
-1. Möglich machen, dass auch beim erstellen von Zwischenpunkten beim Kabellegen diese Zwischenpunkte, welche direkt benachbrat sind zu nicht-ganzzahligen Koordinaten Positionen von Pins, diese auf die selbe höhe bzw Breite gelöeget wer4den können, nicht nur beim verschieben. (im Ortho Modus)
-2. Möglich machen, dass beim Verschieben von Komponenten ebenfalls Zwischenpunke,w elche auf der selben Höhe/Breite sich befanden, die Hoche bzw Breite ebenfalls um den Verschiebungsfaktor angepasst werden.

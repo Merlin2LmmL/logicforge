@@ -30,6 +30,11 @@ registerComponentType({
     const out = injected !== undefined ? injected : fromInt(state.value ?? 0, width);
     return { outputs: { out }, state };
   },
+  help: {
+    summary: 'Definiert einen Eingangs-Pin der äußeren Schnittstelle einer eigenen Komponente.',
+    usage: 'Nur innerhalb einer eigenen (zusammengefassten) Komponente verwenden. Beim eigenständigen Testen verhält es sich wie ein Switch (anklicken zum Umschalten); als Teil einer Komponente wird der Wert von außen eingespeist. Name und Bitbreite bestimmen Label und Breite des äußeren Pins.',
+    pins: { out: 'Eingangswert (von außen eingespeist oder wie ein Switch gesetzt).' },
+  },
 });
 
 registerComponentType({
@@ -46,4 +51,9 @@ registerComponentType({
   init: () => ({}),
   isInterface: 'out',
   evaluate: ({ inputs, params }) => ({ outputs: {}, state: { last: inputs.in0 || new Array(params.width ?? 1).fill(FLOATING) } }),
+  help: {
+    summary: 'Definiert einen Ausgangs-Pin der äußeren Schnittstelle einer eigenen Komponente.',
+    usage: 'Nur innerhalb einer eigenen (zusammengefassten) Komponente verwenden. Beim eigenständigen Testen verhält es sich wie eine Probe; als Teil einer Komponente wird der Wert nach außen durchgereicht. Name und Bitbreite bestimmen Label und Breite des äußeren Pins.',
+    pins: { in0: 'Wert, der nach außen als Komponenten-Ausgang erscheint.' },
+  },
 });

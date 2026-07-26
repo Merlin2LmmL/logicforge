@@ -15,6 +15,11 @@ registerComponentType({
     return { outputs: {}, state: { last: inputs.in0 || new Array(width).fill(FLOATING) } };
   },
   isLampLike: true,
+  help: {
+    summary: 'Lampe: leuchtet je nach anliegendem Bit (0/1) und zeigt Konflikte/offene Leitungen farblich an.',
+    usage: 'Zum schnellen visuellen Prüfen einzelner Bits oder kleiner Busse an eine Leitung anschließen.',
+    pins: { in0: 'Anzuzeigendes Signal.' },
+  },
 });
 
 registerComponentType({
@@ -43,6 +48,11 @@ registerComponentType({
     if (mode === 'dec') return bitsToDecString(bits);
     return bitsToHexString(bits);
   },
+  help: {
+    summary: 'Zeigt einen Mehrbit-Wert als Zahl an (hex, dezimal oder binär).',
+    usage: 'Bitbreite und Anzeigeformat im Eigenschaften-Panel wählen; nützlich zum Ablesen von Bus-/Registerwerten.',
+    pins: { in0: 'Anzuzeigender Wert.' },
+  },
 });
 
 registerComponentType({
@@ -57,6 +67,11 @@ registerComponentType({
   evaluate: ({ inputs, params }) => {
     const width = params.width ?? 1;
     return { outputs: {}, state: { last: inputs.in0 || new Array(width).fill(FLOATING) } };
+  },
+  help: {
+    summary: 'Messpunkt: zeigt beim Hover die aktuellen Bitwerte einer Leitung an, ohne die Schaltung zu beeinflussen.',
+    usage: 'An eine beliebige Stelle anschließen und mit der Maus über den Pin fahren, um den Wert im Tooltip zu sehen.',
+    pins: { in0: 'Zu messendes Signal.' },
   },
 });
 
@@ -75,6 +90,40 @@ registerComponentType({
     const segs = {};
     for (const id of ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'dp']) segs[id] = inputs[id]?.[0] === 1 ? 1 : 0;
     return { outputs: {}, state: { segs } };
+  },
+  help: {
+    summary: '7-Segment-Anzeige für Ziffern: jedes Segment (a-g) und der Dezimalpunkt (dp) wird einzeln über je 1 Bit angesteuert.',
+    usage: 'Meist über einen BCD/7-Segment-Dekoder (z.B. eine ROM-Tabelle oder Code-Komponente) ansteuern, der aus einer Ziffer die passenden Segmentmuster erzeugt.',
+    pins: { a: 'oberes Segment.', b: 'oben rechts.', c: 'unten rechts.', d: 'unteres Segment.', e: 'unten links.', f: 'oben links.', g: 'Mittelsegment.', dp: 'Dezimalpunkt.' },
+  },
+});
+
+// 16-Segment-Anzeige: erweitert das 7-Segment-Prinzip um geteilte Ober-/Unterkante
+// und vier Diagonalen/Vertikalen zum Bildmittelpunkt, damit auch Buchstaben
+// darstellbar sind (nicht nur Ziffern). Segment-Namen folgen der üblichen
+// "Starburst"-Konvention: a1/a2 und d1/d2 geteilte Ober-/Unterkante, g1/g2
+// geteilte Mittellinie, h/i/j/k/l/m die sechs Speichen zum Zentrum.
+registerComponentType({
+  type: 'SEG16',
+  category: 'Debug',
+  label: '16-Segment',
+  color: '#7cff9e',
+  paramsSchema: [],
+  pins: () => ['a1', 'a2', 'b', 'c', 'd1', 'd2', 'e', 'f', 'g1', 'g2', 'h', 'i', 'j', 'k', 'l', 'm', 'dp']
+    .map((id, i) => ({ id, label: id.toUpperCase(), dir: 'in', width: 1, side: 'left', order: i })),
+  size: () => ({ w: 4, h: 7 }),
+  init: () => ({}),
+  evaluate: ({ inputs }) => {
+    const segs = {};
+    for (const id of ['a1', 'a2', 'b', 'c', 'd1', 'd2', 'e', 'f', 'g1', 'g2', 'h', 'i', 'j', 'k', 'l', 'm', 'dp']) {
+      segs[id] = inputs[id]?.[0] === 1 ? 1 : 0;
+    }
+    return { outputs: {}, state: { segs } };
+  },
+  help: {
+    summary: '16-Segment-Anzeige: erweiterte 7-Segment-Anzeige mit geteilter Ober-/Unterkante und Diagonalen, damit auch Buchstaben darstellbar sind, nicht nur Ziffern.',
+    usage: 'Jedes der 16 Segmente einzeln mit 1 Bit ansteuern, üblicherweise über eine ROM-Zeichensatztabelle o.ä.',
+    pins: { dp: 'Dezimalpunkt.' },
   },
 });
 
@@ -95,5 +144,10 @@ registerComponentType({
     if (mode === 'bin') return bitsToBinaryString(bits);
     if (mode === 'dec') return bitsToDecString(bits);
     return bitsToHexString(bits);
+  },
+  help: {
+    summary: 'Größere Bus-Anzeige, ähnlich Display, für breitere Busse mit mehr Platz zum Ablesen.',
+    usage: 'An einen breiten Bus anschließen; Anzeigeformat im Eigenschaften-Panel wählen.',
+    pins: { in0: 'Anzuzeigender Bus.' },
   },
 });

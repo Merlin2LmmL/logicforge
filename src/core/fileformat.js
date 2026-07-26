@@ -14,7 +14,7 @@
 //   "definitions": [ <definition>, ... ]  // dependency closure, composite defs embed their own plain circuit
 // }
 
-import { Circuit } from './model.js';
+import { Circuit, stateReplacer, stateReviver } from './model.js';
 import { collectDependencies, getDefinition, installDefinition, circuitToPlain } from './library.js';
 
 export const FORMAT_ID = 'logicforge-circuit';
@@ -32,11 +32,11 @@ export function serializeCircuit(circuit, meta = {}) {
     circuit: circuitToPlain(circuit),
     definitions: [...deps.values()],
   };
-  return JSON.stringify(envelope, null, 2);
+  return JSON.stringify(envelope, stateReplacer, 2);
 }
 
 export function deserializeCircuit(jsonText) {
-  const envelope = JSON.parse(jsonText);
+  const envelope = JSON.parse(jsonText, stateReviver);
   validateEnvelope(envelope);
   for (const def of envelope.definitions || []) installDefinition(def);
   const circuit = envelope.kind === 'component'
@@ -59,11 +59,11 @@ export function serializeComponent(definitionId, meta = {}) {
     definition: def,
     definitions: [def, ...deps.values()],
   };
-  return JSON.stringify(envelope, null, 2);
+  return JSON.stringify(envelope, stateReplacer, 2);
 }
 
 export function importComponentFile(jsonText) {
-  const envelope = JSON.parse(jsonText);
+  const envelope = JSON.parse(jsonText, stateReviver);
   validateEnvelope(envelope);
   if (envelope.kind !== 'component') throw new Error('Datei enthält keine einzelne Komponente (kind != component)');
   for (const def of envelope.definitions || [envelope.definition]) installDefinition(def);

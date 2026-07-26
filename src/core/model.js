@@ -6,6 +6,28 @@ export function nextId(prefix = 'id') {
   return `${prefix}_${(idCounter++).toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
+// Component state (e.g. RAM/ROM contents) sometimes uses a Map for sparse storage.
+// Map instances do not survive a plain JSON.stringify/parse round-trip (they turn into
+// `{}`), which then crashes the next evaluate() call with things like
+// "mem.has is not a function". Every place that JSON-round-trips instance/circuit state
+// (undo/redo history, copy/paste, autosave, .lgf save/load) must use these so Maps
+// (and Sets, same problem) survive intact.
+export function stateReplacer(key, value) {
+  if (value instanceof Map) return { __type: 'Map', entries: [...value.entries()] };
+  if (value instanceof Set) return { __type: 'Set', values: [...value.values()] };
+  return value;
+}
+export function stateReviver(key, value) {
+  if (value && typeof value === 'object') {
+    if (value.__type === 'Map' && Array.isArray(value.entries)) return new Map(value.entries);
+    if (value.__type === 'Set' && Array.isArray(value.values)) return new Set(value.values);
+  }
+  return value;
+}
+export function cloneState(state) {
+  return JSON.parse(JSON.stringify(state, stateReplacer), stateReviver);
+}
+
 export class ComponentInstance {
   constructor({ id, type, x, y, rot = 0, params = {}, state = {}, label = '' } = {}) {
     this.id = id || nextId('c');
@@ -22,7 +44,7 @@ export class ComponentInstance {
     return new ComponentInstance({
       id: this.id, type: this.type, x: this.x, y: this.y, rot: this.rot,
       params: JSON.parse(JSON.stringify(this.params)),
-      state: JSON.parse(JSON.stringify(this.state)),
+      state: cloneState(this.state),
       label: this.label,
     });
   }

@@ -1,5 +1,5 @@
 import { registerComponentType, unregisterComponentType, getComponentType } from './registry.js';
-import { Circuit, nextId } from './model.js';
+import { Circuit, nextId, stateReplacer, stateReviver } from './model.js';
 import { settleCircuit } from './simulator.js';
 import { FLOATING, makeFloating } from './bits.js';
 
@@ -215,7 +215,7 @@ export function circuitToPlain(circuit) {
 export function persist() {
   try {
     const arr = [...definitions.values()];
-    localStorage.setItem(LS_KEY, JSON.stringify(arr));
+    localStorage.setItem(LS_KEY, JSON.stringify(arr, stateReplacer));
   } catch (e) {
     console.warn('LogicForge: could not persist library', e);
   }
@@ -225,7 +225,7 @@ export function loadFromStorage() {
   try {
     const raw = localStorage.getItem(LS_KEY);
     if (!raw) return;
-    const arr = JSON.parse(raw);
+    const arr = JSON.parse(raw, stateReviver);
     for (const def of arr) installDefinition(def);
   } catch (e) {
     console.warn('LogicForge: could not load library', e);

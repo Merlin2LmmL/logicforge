@@ -22,6 +22,11 @@ registerComponentType({
     for (let i = 0; i < width; i++) outputs[`b${i}`] = [bus[i] ?? FLOATING];
     return { outputs, state: {} };
   },
+  help: {
+    summary: 'Splitter: zerlegt einen breiten Bus in einzelne 1-Bit-Leitungen.',
+    usage: 'Busbreite einstellen, BUS anschließen; b0..bN liefern die einzelnen Bits (b0 = niederwertigstes Bit).',
+    pins: { bus: 'Der aufzuteilende Bus.' },
+  },
 });
 
 registerComponentType({
@@ -45,6 +50,11 @@ registerComponentType({
     for (let i = 0; i < width; i++) bus[i] = (inputs[`b${i}`] || [FLOATING])[0];
     return { outputs: { bus }, state: {} };
   },
+  help: {
+    summary: 'Merger: fügt einzelne 1-Bit-Leitungen zu einem breiten Bus zusammen (Gegenstück zum Splitter).',
+    usage: 'Busbreite einstellen, b0..bN mit einzelnen Signalen verbinden (b0 = niederwertigstes Bit); BUS liefert den zusammengesetzten Wert.',
+    pins: { bus: 'Der zusammengesetzte Bus.' },
+  },
 });
 
 registerComponentType({
@@ -61,6 +71,11 @@ registerComponentType({
   init: () => ({}),
   isTunnel: 'in',
   evaluate: ({ inputs, params }) => ({ outputs: {}, state: { last: inputs.in0 || new Array(params.width ?? 1).fill(FLOATING) } }),
+  help: {
+    summary: 'Tunnel-Eingang: verbindet sich drahtlos mit allen Tunnel-Ausgängen gleichen Netznamens - erspart lange, kreuzende Kabel.',
+    usage: 'Netzname im Parameter vergeben; jeder Tunnel-Ausgang mit demselben Namen empfängt dieses Signal, egal wo er in der Schaltung platziert ist.',
+    pins: { in0: 'In den Tunnel einzuspeisendes Signal.' },
+  },
 });
 
 registerComponentType({
@@ -78,4 +93,9 @@ registerComponentType({
   isTunnel: 'out',
   // outputs are injected by the simulator (value comes from matching TUNNEL_IN nodes)
   evaluate: ({ state, params }) => ({ outputs: { out: state.injected || new Array(params.width ?? 1).fill(FLOATING) }, state }),
+  help: {
+    summary: 'Tunnel-Ausgang: liefert das Signal des/der Tunnel-Eingänge mit gleichem Netznamen (Gegenstück zu Tunnel-Ein).',
+    usage: 'Gleichen Netznamen wie am gewünschten Tunnel-Eingang vergeben; der Wert erscheint hier, ohne ein Kabel quer durch die Schaltung ziehen zu müssen.',
+    pins: { out: 'Signal des zugehörigen Tunnel-Eingangs.' },
+  },
 });

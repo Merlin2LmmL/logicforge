@@ -1,5 +1,5 @@
 import { registerComponentType } from '../core/registry.js';
-import { fromInt, toInt } from '../core/bits.js';
+import { fromInt, toInt, FLOATING } from '../core/bits.js';
 
 registerComponentType({
   type: 'SWITCH',
@@ -17,6 +17,11 @@ registerComponentType({
     return { ...state, value: width === 1 ? (state.value ? 0 : 1) : state.value };
   },
   evaluate: ({ state, params }) => ({ outputs: { out: fromInt(state.value ?? 0, params.width ?? 1) }, state }),
+  help: {
+    summary: 'Manueller Ein-/Ausgabe-Schalter: hält seinen Zustand, bis er wieder geändert wird.',
+    usage: 'Bei 1 Bit Breite: anklicken zum Umschalten (0/1). Bei größerer Bitbreite den Wert stattdessen im Eigenschaften-Panel setzen.',
+    pins: { out: 'Aktueller Schalterwert.' },
+  },
 });
 
 registerComponentType({
@@ -32,6 +37,11 @@ registerComponentType({
   onPointerDown: (state) => ({ ...state, pressed: true }),
   onPointerUp: (state) => ({ ...state, pressed: false }),
   evaluate: ({ state }) => ({ outputs: { out: [state.pressed ? 1 : 0] }, state }),
+  help: {
+    summary: 'Taster: liefert 1 nur solange die Maustaste gedrückt gehalten wird, sonst 0.',
+    usage: 'Zum Auslösen einzelner Aktionen (Reset, manueller Takt-Impuls, Trigger) gedrückt halten.',
+    pins: { out: '1 während gedrückt, sonst 0.' },
+  },
 });
 
 registerComponentType({
@@ -41,23 +51,43 @@ registerComponentType({
   color: '#e0e6ec',
   paramsSchema: [
     { key: 'hz', label: 'Frequenz (Hz), 0 = manuell', kind: 'int', min: 0, max: 1_000_000, step: 1, default: 1 },
+    { key: 'pulseMs', label: 'Impulsdauer (ms), 0 = 50% Tastgrad', kind: 'int', min: 0, max: 1_000_000, step: 1, default: 0 },
   ],
   pins: () => [{ id: 'out', label: '', dir: 'out', width: 1, side: 'right', order: 0 }],
   size: () => ({ w: 2, h: 2 }),
-  init: () => ({ value: 0, lastToggle: 0 }),
+  init: () => ({ value: 0, cycleStart: 0 }),
   interactive: true,
-  onActivate: (state) => ({ ...state, value: state.value ? 0 : 1, lastToggle: performance.now() }),
+  // Manueller Modus (hz=0): normaler Ein/Aus-Klick, kein Timing beteiligt.
+  onActivate: (state, params) => {
+    if ((params?.hz ?? 0) > 0) return state;
+    return { ...state, value: state.value ? 0 : 1 };
+  },
+  // Phasenbasiert statt Toggle-mit-Delta: die Zykluslänge wird aus `now` direkt
+  // hergeleitet (elapsed % period), statt bei jedem Tick zu toggeln. Das verhindert
+  // Drift durch unregelmäßige Frame-Zeiten und erlaubt eine von der Frequenz
+  // unabhängige Impulsdauer (Tastgrad ungleich 50%).
   evaluate: ({ state, params, now }) => {
     const hz = params.hz ?? 0;
-    let { value, lastToggle } = state;
-    if (hz > 0) {
-      const periodMs = 1000 / (2 * hz); // half period: one toggle per half period
-      if (now - (lastToggle || 0) >= periodMs) {
-        value = value ? 0 : 1;
-        lastToggle = now;
-      }
+    if (hz <= 0) {
+      return { outputs: { out: [state.value ?? 0] }, state };
     }
-    return { outputs: { out: [value] }, state: { value, lastToggle } };
+    const period = 1000 / hz;
+    const pulse = Math.min(params.pulseMs > 0 ? params.pulseMs : period / 2, period);
+    let cycleStart = state.cycleStart || 0;
+    let elapsed = now - cycleStart;
+    if (elapsed < 0 || elapsed >= period) {
+      // Zyklusstart neu ausrichten (z.B. nach Frequenzänderung oder Tab-Pause),
+      // statt aufzusummieren und wegzudriften.
+      cycleStart = now - (((elapsed % period) + period) % period);
+      elapsed = now - cycleStart;
+    }
+    const value = elapsed < pulse ? 1 : 0;
+    return { outputs: { out: [value] }, state: { value, cycleStart } };
+  },
+  help: {
+    summary: 'Taktgeber: bei Frequenz 0 ein manueller Ein/Aus-Schalter, bei Frequenz >0 ein automatischer Rechteck-Oszillator.',
+    usage: 'Frequenz (Hz) = 0 lässt sich per Klick manuell umschalten, ideal zum schrittweisen Debuggen von Flipflops/Registern. Frequenz >0 läuft automatisch; Impulsdauer=0 ergibt 50% Tastgrad, sonst feste Impulslänge in ms.',
+    pins: { out: 'Taktsignal.' },
   },
 });
 
@@ -85,6 +115,11 @@ registerComponentType({
   size: () => ({ w: 2, h: 2 }),
   init: () => ({}),
   evaluate: () => ({ outputs: { out: [1] }, state: {} }),
+  help: {
+    summary: 'Fester Logikpegel 1 (wie ein Pull-up-Widerstand an VCC).',
+    usage: 'An offene/unbeschaltete Eingänge hängen, damit diese statt zu floaten definiert auf 1 liegen.',
+    pins: { out: 'Konstant 1.' },
+  },
 });
 
 registerComponentType({
@@ -98,6 +133,11 @@ registerComponentType({
   size: () => ({ w: 2, h: 2 }),
   init: () => ({}),
   evaluate: () => ({ outputs: { out: [0] }, state: {} }),
+  help: {
+    summary: 'Fester Logikpegel 0 (wie ein Pull-down-Widerstand an GND).',
+    usage: 'An offene/unbeschaltete Eingänge hängen, damit diese statt zu floaten definiert auf 0 liegen.',
+    pins: { out: 'Konstant 0.' },
+  },
 });
 
 registerComponentType({
@@ -116,6 +156,11 @@ registerComponentType({
     const width = params.width ?? 8;
     const v = parseInt(params.value ?? '0', 16);
     return { outputs: { out: fromInt(Number.isFinite(v) ? v : 0, width) }, state: {} };
+  },
+  help: {
+    summary: 'Fester, im Eigenschaften-Panel einstellbarer Mehrbit-Wert (Hex).',
+    usage: 'Bitbreite und Hex-Wert im Eigenschaften-Panel setzen - praktisch für feste Adressen, Opcodes oder Testwerte.',
+    pins: { out: 'Der konfigurierte konstante Wert.' },
   },
 });
 
@@ -140,6 +185,11 @@ registerComponentType({
       b: toInt(inputs.b || new Array(8).fill(FLOATING)) ?? 0,
     },
   }),
+  help: {
+    summary: 'RGB-LED: zeigt eine Farbe aus drei 8-Bit-Kanälen (Rot, Grün, Blau).',
+    usage: 'An R/G/B jeweils einen 8-Bit-Wert (0-255) anlegen, z.B. aus Konstanten oder Registern.',
+    pins: { r: 'Rot-Kanal (0-255).', g: 'Grün-Kanal (0-255).', b: 'Blau-Kanal (0-255).' },
+  },
 });
 
 // Geometrie des Tracks in Bauteil-lokalen Weltkoordinaten. Wird sowohl vom
@@ -189,5 +239,10 @@ registerComponentType({
     const { lo, hi } = sliderRange(params);
     const value = Math.max(lo, Math.min(hi, state.value ?? lo));
     return { outputs: { out: fromInt(value, params.width ?? 8) }, state: { ...state, value } };
+  },
+  help: {
+    summary: 'Schieberegler für einen einstellbaren Zahlenwert zwischen Minimum und Maximum.',
+    usage: 'Mit der Maus auf dem Regler ziehen. Min/Max/Bitbreite/Darstellung (dez/hex/bin) im Eigenschaften-Panel konfigurieren.',
+    pins: { out: 'Aktueller Reglerwert.' },
   },
 });

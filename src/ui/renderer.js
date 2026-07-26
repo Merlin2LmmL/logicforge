@@ -1,6 +1,7 @@
 import { GRID, computeLayout, effectiveSize, wirePath, getDef, pointToSegDist } from './layout.js';
 import { FLOATING, CONFLICT, toInt } from '../core/bits.js';
 import { sliderTrackRect, formatSliderValue } from '../components/io.js';
+import { GAMEPAD_SIZE, GAMEPAD_BUTTONS } from '../components/peripherals.js';
 
 export const COLORS = {
   bg: '#0a0e14',
@@ -128,8 +129,10 @@ function drawGrid(ctx, camera, w, h) {
   ctx.fillStyle = COLORS.gridDot;
   const startCol = Math.floor(-camera.panX / step);
   const startRow = Math.floor(-camera.panY / step);
-  const ox = (-camera.panX) - startCol * step;
-  const oy = (-camera.panY) - startRow * step;
+  // Muss mit worldToScreen übereinstimmen (screenX = n*step + panX), sonst springt die
+  // Phase des Rasters bei jedem Zoomschritt, da sich `step` ändert.
+  const ox = startCol * step + camera.panX;
+  const oy = startRow * step + camera.panY;
 
   for (let x = ox, col = startCol; x < w; x += step, col++) {
     for (let y = oy, row = startRow; y < h; y += step, row++) {
@@ -158,7 +161,11 @@ function drawWire(ctx, camera, points, state, selected, time, lineWidth, invalid
   ctx.strokeStyle = invalid ? COLORS.wireConflict : wireColor(state);
   ctx.lineWidth = (selected ? lineWidth + 1.5 : lineWidth) * camera.zoom;
   if (state === 'float' || isDraft) ctx.setLineDash([5 * camera.zoom, 4 * camera.zoom]);
-  else if (state === 'high') { ctx.setLineDash([8 * camera.zoom, 6 * camera.zoom]); ctx.lineDashOffset = -(time / 40) % 14; }
+  else if (state === 'high') {
+    const period = 14 * camera.zoom; // muss exakt der Summe aus [8*zoom, 6*zoom] entsprechen
+    ctx.setLineDash([8 * camera.zoom, 6 * camera.zoom]);
+    ctx.lineDashOffset = -(time / 40) % period;
+  }
   else ctx.setLineDash([]);
   tracePath(ctx, pts);
   ctx.stroke();
@@ -555,10 +562,14 @@ function drawBody(ctx, def, inst, pw, ph, opts) {
   if (type === 'MUX') return drawMuxDemux(ctx, pw, ph, inst, opts, def, true);
   if (type === 'DEMUX') return drawMuxDemux(ctx, pw, ph, inst, opts, def, false);
   if (type === 'SEVENSEG') return drawSevenSeg(ctx, pw, ph, inst, opts);
+  if (type === 'SEG16') return drawSixteenSeg(ctx, pw, ph, inst, opts);
   if (type === 'TRISTATE') return drawTriState(ctx, pw, ph, def, opts);
   if (type === 'RGBLED') return drawRgbLed(ctx, pw, ph, inst, opts);
   if (type === 'BUSWATCH') return drawBusWatch(ctx, pw, ph, inst, opts, def);
   if (type === 'SLIDER') return drawSliderTrack(ctx, pw, ph, inst, opts);
+  if (type === 'GAMEPAD') return drawGamepad(ctx, pw, ph, inst, opts);
+  if (type === 'TERMINAL') return drawTerminal(ctx, pw, ph, inst, opts);
+  if (type === 'PIXELDISPLAY') return drawPixelDisplay(ctx, pw, ph, inst, opts);
 
   // generic box (registers, RAM, DFF, custom composite/code components...)
   boxRect(ctx, pw, ph, COLORS.compFill, opts.selected ? COLORS.compBorderSelected : def.color || COLORS.compBorder, opts.hover);
@@ -787,7 +798,10 @@ function drawSevenSeg(ctx, pw, ph, inst, opts) {
   };
   ctx.save();
   ctx.lineCap = 'round';
-  for (const [id, [[x0, y0], [x1, y1]]] of Object.entries(lines)) {
+  // Nicht-leuchtende Segmente zuerst zeichnen, leuchtende zuletzt - sonst legt sich
+  // ein dunkles Segment über den Shadow-Blur eines benachbarten aktiven Segments.
+  const entries = Object.entries(lines).sort((a, b) => (!!segs[a[0]] ? 1 : 0) - (!!segs[b[0]] ? 1 : 0));
+  for (const [id, [[x0, y0], [x1, y1]]] of entries) {
     const on = !!segs[id];
     ctx.beginPath();
     ctx.moveTo(x0, y0);
@@ -800,10 +814,130 @@ function drawSevenSeg(ctx, pw, ph, inst, opts) {
   }
   ctx.shadowBlur = 0;
   ctx.beginPath();
-  ctx.arc(right + 5, bottom, 2.4, 0, Math.PI * 2);
+  ctx.arc(right + 5, bottom, 3.4, 0, Math.PI * 2);
   ctx.fillStyle = segs.dp ? '#7cff9e' : '#1c2e22';
   ctx.fill();
   ctx.restore();
+}
+
+function drawSixteenSeg(ctx, pw, ph, inst, opts) {
+  boxRect(ctx, pw, ph, '#0d1712', opts.selected ? COLORS.compBorderSelected : '#274a2e', opts.hover);
+  const segs = inst.state?.segs || {};
+  const dw = pw * 0.42, dh = ph * 0.62;
+  const left = -dw / 2, right = dw / 2, top = -dh / 2, mid = 0, bottom = dh / 2;
+  const lines = {
+    a1: [[left, top], [0, top]], a2: [[0, top], [right, top]],
+    b: [[right, top], [right, mid]], c: [[right, mid], [right, bottom]],
+    d1: [[left, bottom], [0, bottom]], d2: [[0, bottom], [right, bottom]],
+    e: [[left, mid], [left, bottom]], f: [[left, top], [left, mid]],
+    g1: [[left, mid], [0, mid]], g2: [[0, mid], [right, mid]],
+    h: [[left, top], [0, mid]], i: [[0, top], [0, mid]], j: [[right, top], [0, mid]],
+    k: [[left, bottom], [0, mid]], l: [[0, bottom], [0, mid]], m: [[right, bottom], [0, mid]],
+  };
+  ctx.save();
+  ctx.lineCap = 'round';
+  const entries = Object.entries(lines).sort((a, b) => (!!segs[a[0]] ? 1 : 0) - (!!segs[b[0]] ? 1 : 0));
+  for (const [id, [[x0, y0], [x1, y1]]] of entries) {
+    const on = !!segs[id];
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.strokeStyle = on ? '#7cff9e' : '#1c2e22';
+    ctx.lineWidth = Math.max(1.6, ph * 0.055);
+    ctx.shadowColor = on ? '#7cff9e' : 'transparent';
+    ctx.shadowBlur = on ? 5 : 0;
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+  ctx.beginPath();
+  ctx.arc(right + 5, bottom, 3.4, 0, Math.PI * 2);
+  ctx.fillStyle = segs.dp ? '#7cff9e' : '#1c2e22';
+  ctx.fill();
+  ctx.restore();
+}
+
+// Kleines Tastatur-Symbol oben rechts, solange ein Bauteil mit Tastatursteuerung
+// (Terminal, Gamepad) ausgewählt ist - zeigt an, dass Tastendrücke jetzt an dieses
+// Bauteil statt an globale Editor-Shortcuts gehen.
+function drawKeyboardFocusHint(ctx, pw, ph) {
+  ctx.save();
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#5eead4';
+  ctx.fillText('⌨', pw / 2 - 3, -ph / 2 + 2);
+  ctx.restore();
+}
+
+function drawGamepad(ctx, pw, ph, inst, opts) {
+  boxRect(ctx, pw, ph, COLORS.compFill, opts.selected ? COLORS.compBorderSelected : COLORS.compBorder, opts.hover);
+  if (opts.selected) drawKeyboardFocusHint(ctx, pw, ph);
+  const keys = inst.state?.keys || {};
+  for (const [key, b] of Object.entries(GAMEPAD_BUTTONS)) {
+    const cx = (b.cx - 0.5) * pw, cy = (b.cy - 0.5) * ph;
+    const hw = b.hw * pw, hh = b.hh * ph;
+    const pressed = !!keys[key];
+    ctx.beginPath();
+    if (b.shape === 'circle') {
+      ctx.arc(cx, cy, Math.min(hw, hh), 0, Math.PI * 2);
+    } else {
+      const r = Math.min(hw, hh) * 0.4;
+      ctx.moveTo(cx - hw + r, cy - hh);
+      ctx.arcTo(cx + hw, cy - hh, cx + hw, cy + hh, r);
+      ctx.arcTo(cx + hw, cy + hh, cx - hw, cy + hh, r);
+      ctx.arcTo(cx - hw, cy + hh, cx - hw, cy - hh, r);
+      ctx.arcTo(cx - hw, cy - hh, cx + hw, cy - hh, r);
+    }
+    ctx.closePath();
+    ctx.fillStyle = pressed ? '#5eead4' : '#232c38';
+    ctx.fill();
+    ctx.strokeStyle = pressed ? '#5eead4' : '#4a5566';
+    ctx.lineWidth = 1.3;
+    ctx.stroke();
+  }
+}
+
+function drawTerminal(ctx, pw, ph, inst, opts) {
+  boxRect(ctx, pw, ph, '#0a1410', opts.selected ? COLORS.compBorderSelected : '#274a2e', opts.hover);
+  if (opts.selected) drawKeyboardFocusHint(ctx, pw, ph);
+  const lines = inst.state?.lines || [''];
+  const rows = inst.params?.rows ?? 12;
+  const lineH = ph / Math.max(rows, 1);
+  const fontSize = Math.max(4, Math.min(11, lineH * 0.82));
+  ctx.save();
+  ctx.font = `${fontSize}px "JetBrains Mono", monospace`;
+  ctx.fillStyle = '#7cff9e';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  const startY = -ph / 2 + 2;
+  for (let i = 0; i < lines.length; i++) {
+    ctx.fillText(lines[i], -pw / 2 + 4, startY + i * lineH, pw - 8);
+  }
+  ctx.restore();
+}
+
+function drawPixelDisplay(ctx, pw, ph, inst, opts) {
+  boxRect(ctx, pw, ph, '#050708', opts.selected ? COLORS.compBorderSelected : COLORS.compBorder, opts.hover);
+  const cols = inst.state?.cols ?? inst.params?.cols ?? 16;
+  const rows = inst.state?.rows ?? inst.params?.rows ?? 16;
+  const mode = inst.state?.mode ?? inst.params?.mode ?? 'mono';
+  const fb = inst.state?.fb || [];
+  const cellW = pw / cols, cellH = ph / rows;
+  const x0 = -pw / 2, y0 = -ph / 2;
+  for (let ry = 0; ry < rows; ry++) {
+    for (let rx = 0; rx < cols; rx++) {
+      const v = fb[ry * cols + rx] || 0;
+      let color;
+      if (mode === 'rgb') {
+        const r = (v >> 16) & 0xff, g = (v >> 8) & 0xff, b = v & 0xff;
+        color = `rgb(${r},${g},${b})`;
+      } else {
+        color = v ? '#7cff9e' : '#0d1712';
+      }
+      ctx.fillStyle = color;
+      ctx.fillRect(x0 + rx * cellW, y0 + ry * cellH, Math.ceil(cellW), Math.ceil(cellH));
+    }
+  }
 }
 
 function drawTriState(ctx, pw, ph, def, opts) {

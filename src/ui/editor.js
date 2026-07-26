@@ -1,4 +1,4 @@
-import { Circuit, ComponentInstance, Wire, nextId } from '../core/model.js';
+import { Circuit, ComponentInstance, Wire, nextId, stateReplacer, stateReviver } from '../core/model.js';
 import { getComponentType, categorized, defaultParams } from '../core/registry.js';
 import { settleCircuit, resetCircuitState } from '../core/simulator.js';
 import {
@@ -52,6 +52,21 @@ export class Editor {
     this.wireValues = new Map();
     this.instanceOutputs = new Map();
 
+    // ---- schnelle Taktsimulation ----
+    // `simTime` ist eine eigene, virtuelle Simulationszeit (in ms) - komplett getrennt von
+    // der echten Bildschirm-Zeit. Pro angezeigtem Frame wird sie NICHT nur um ein einziges
+    // rAF-Delta erhöht, sondern in vielen kleinen Schritten (`simStepMs`), damit ein Takt,
+    // der viel schneller als 60 Hz laufen soll (z.B. 1 MHz = 1000 Perioden pro ms), auch
+    // wirklich so oft "tickt" und nicht nur einmal pro Bildschirm-Frame. Nur das Ergebnis
+    // des LETZTEN Sub-Schritts wird gezeichnet - der Zustand aller Bauteile (Register,
+    // Speicher, Bildschirm-Framebuffer, ...) akkumuliert aber über alle Sub-Schritte, das
+    // Ergebnis verhält sich also wie ein "echter" schneller Taktgeber.
+    this.simTime = 0;
+    this.simStepMs = 0.001;      // Auflösung eines Sub-Schritts: 1 µs
+    this.simSpeed = 1000;        // "virtuelle ms Simulationszeit" pro 1ms Echtzeit (1000 = 1000x)
+    this.maxSubStepsPerFrame = 20000; // Deckel, damit ein extrem hoher Takt die UI nicht einfriert
+    this._lastFrameNow = null;
+
     this.history = [];
     this.historyIndex = -1;
 
@@ -85,6 +100,10 @@ export class Editor {
   }
 
   _resizeCanvas() {
+    // Verhindert, dass der Browser bei Touch-Eingaben selbst pannt/zoomt (Pinch-Zoom der
+    // Seite, Doppeltipp-Zoom, Scroll-Bounce) - wir wollen Pinch/Pan komplett selbst
+    // steuern (siehe _onTouchStart/_onTouchMove).
+    this.canvas.style.touchAction = 'none';
     const rect = this.dom.canvasWrap.getBoundingClientRect();
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     this.canvas.width = Math.max(1, Math.round(rect.width * dpr));
@@ -142,12 +161,37 @@ export class Editor {
 
   _frame(now) {
     this.time = now;
-    const { wireValues, instanceOutputs } = settleCircuit(this.circuit, { now });
+
+    // Echte vergangene Zeit seit dem letzten Frame (robust gegen Tab-Wechsel/Drosselung:
+    // ein sehr großes Delta - z.B. nach Minuten im Hintergrundtab - wird gekappt, damit wir
+    // nicht Millionen Sub-Schritte in einem Frame nachholen müssen).
+    const realDeltaMs = this._lastFrameNow != null ? Math.min(now - this._lastFrameNow, 250) : 16;
+    this._lastFrameNow = now;
+
+    const simDeltaMs = realDeltaMs * this.simSpeed;
+    const stepMs = Math.max(this.simStepMs, simDeltaMs / this.maxSubStepsPerFrame);
+    let remaining = simDeltaMs;
+    let wireValues = this.wireValues, instanceOutputs = this.instanceOutputs;
+
+    while (remaining > 0) {
+      this.simTime += stepMs;
+      remaining -= stepMs;
+      ({ wireValues, instanceOutputs } = settleCircuit(this.circuit, { now: this.simTime }));
+    }
+
     this.wireValues = wireValues;
     this.instanceOutputs = instanceOutputs;
     this._draw();
     this._updateStatusBar();
     requestAnimationFrame((t) => this._frame(t));
+  }
+
+  // Simulationsgeschwindigkeit einstellen: `speed` ist der Faktor "virtuelle ms
+  // Simulationszeit pro 1 ms Echtzeit" (1 = Echtzeit, 1000 = 1000x schneller). Für einen
+  // Taktgeber mit Periode P (in seiner eigenen Zeiteinheit passend zu `now`) heißt das
+  // effektiv: die Taktfrequenz, die er "sieht", wird mit `speed` multipliziert.
+  setSimSpeed(speed) {
+    this.simSpeed = Math.max(1, speed);
   }
 
   _draw() {
@@ -260,6 +304,13 @@ export class Editor {
     c.addEventListener('contextmenu', (e) => this._onContextMenu(e));
     c.addEventListener('dblclick', (e) => this._onDblClick(e));
 
+    // Zwei-Finger-Geste = Pinch-Zoom + Pan (ein Finger läuft weiter normal über die
+    // Pointer-Events, z.B. zum Verschieben von Bauteilen oder Ziehen von Kabeln).
+    c.addEventListener('touchstart', (e) => this._onTouchStart(e), { passive: false });
+    c.addEventListener('touchmove', (e) => this._onTouchMove(e), { passive: false });
+    c.addEventListener('touchend', (e) => this._onTouchEnd(e), { passive: false });
+    c.addEventListener('touchcancel', (e) => this._onTouchEnd(e), { passive: false });
+
     window.addEventListener('keydown', (e) => this._onKeyDown(e));
     window.addEventListener('keyup', (e) => this._onKeyUp(e));
     window.addEventListener('beforeunload', () => this._autosave());
@@ -356,7 +407,8 @@ export class Editor {
         }
       }
       if (def?.interactive && def.onPointerDown) {
-        compHit.state = def.onPointerDown(compHit.state, compHit.params || {});
+        const local = { x: wp.x - compHit.x, y: wp.y - compHit.y };
+        compHit.state = def.onPointerDown(compHit.state, compHit.params || {}, local);
         this._buttonPressedId = compHit.id;
       }
       const startPositions = new Map();
@@ -523,6 +575,8 @@ export class Editor {
   
   
   _onPointerUp(e) {
+    const _upSp = this._screenPos(e);
+    const _upWp = screenToWorld(this.camera, _upSp.x, _upSp.y);
     if (this.drag?.kind === 'wire-seg') {
       if (this.drag.moved) this.pushHistory();
       this.drag = null;
@@ -542,8 +596,8 @@ export class Editor {
     }
 
     if (this.wireDraft) {
-      const sp = this._screenPos(e);
-      const wp = screenToWorld(this.camera, sp.x, sp.y);
+      const sp = _upSp;
+      const wp = _upWp;
       const hit = this._findPinAt(wp.x, wp.y);
       if (hit && this._pinsCompatible(this.wireDraft.startInst, this.wireDraft.startPin, hit.inst, hit.pin)) {
         this._connect(this.wireDraft.startInst, this.wireDraft.startPin, hit.inst, hit.pin, this.wireDraft.corners);
@@ -583,12 +637,13 @@ export class Editor {
     if (this.drag?.kind === 'move') {
       const def = this.drag.clickedDef;
       const inst = this.drag.clickedInst;
+      const local = { x: _upWp.x - inst.x, y: _upWp.y - inst.y };
       if (def?.onPointerUp && this._buttonPressedId === inst.id) {
-        inst.state = def.onPointerUp(inst.state, inst.params || {});
+        inst.state = def.onPointerUp(inst.state, inst.params || {}, local);
       }
       this._buttonPressedId = null;
       if (!this.drag.moved && def?.interactive && def.onActivate) {
-        inst.state = def.onActivate(inst.state, inst.params || {});
+        inst.state = def.onActivate(inst.state, inst.params || {}, local);
       }
       if (this.drag.moved) this.pushHistory();
       this.drag = null;
@@ -773,6 +828,52 @@ export class Editor {
     this.camera.panY = sp.y - before.y * GRID * this.camera.zoom;
   }
 
+  // ---------------------------------------------------------------- touch (pinch/pan)
+
+  _touchDist(t0, t1) {
+    return Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+  }
+
+  _touchMid(t0, t1) {
+    const rect = this.canvas.getBoundingClientRect();
+    return { x: (t0.clientX + t1.clientX) / 2 - rect.left, y: (t0.clientY + t1.clientY) / 2 - rect.top };
+  }
+
+  _onTouchStart(e) {
+    if (e.touches.length < 2) return;
+    e.preventDefault();
+    // Eine laufende Ein-Finger-Aktion (Verschieben, Kabel ziehen, Marquee, ...) wird
+    // durch den zweiten Finger abgebrochen, damit sie nicht mit Pinch/Pan kollidiert.
+    this.drag = null;
+    this.marquee = null;
+    if (this.wireDraft) {
+      this.wireDraft = null;
+      this.canvas.classList.remove('mode-wiring');
+    }
+    const [t0, t1] = e.touches;
+    this._touchState = { startDist: this._touchDist(t0, t1) || 1, startZoom: this.camera.zoom };
+  }
+
+  _onTouchMove(e) {
+    if (e.touches.length < 2 || !this._touchState) return;
+    e.preventDefault();
+    const [t0, t1] = e.touches;
+    const dist = this._touchDist(t0, t1);
+    const mid = this._touchMid(t0, t1);
+    // Weltpunkt, der aktuell (mit der noch alten Kamera) unter dem Fingermittelpunkt liegt -
+    // der bleibt nach dem Update exakt unter den Fingern, das ergibt Zoom UND Pan
+    // (Fingerbewegung ohne Abstandsänderung) in einem Rutsch.
+    const before = screenToWorld(this.camera, mid.x, mid.y);
+    const factor = dist / this._touchState.startDist;
+    this.camera.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this._touchState.startZoom * factor));
+    this.camera.panX = mid.x - before.x * GRID * this.camera.zoom;
+    this.camera.panY = mid.y - before.y * GRID * this.camera.zoom;
+  }
+
+  _onTouchEnd(e) {
+    if (e.touches.length < 2) this._touchState = null;
+  }
+
   _onDblClick(e) {
     const sp = this._screenPos(e);
     const wp = screenToWorld(this.camera, sp.x, sp.y);
@@ -780,11 +881,35 @@ export class Editor {
     if (inst) this.dom.focusLabelField?.(inst.id);
   }
 
+  // Ist genau ein Bauteil ausgewählt und bringt einen `onKeyDown`/`onKeyUp`-Handler mit
+  // (z.B. Terminal, Gamepad), bekommt es Tastatureingaben zuerst - vor allen globalen
+  // Shortcuts. So kann man z.B. ins ausgewählte Terminal tippen, ohne dass "r" das
+  // Bauteil dreht oder "Entf" es löscht. Der Handler gibt `null`/`undefined` zurück,
+  // wenn er die Taste nicht kennt - dann greifen die globalen Shortcuts wie gewohnt.
+  _focusedInteractiveComponent() {
+    if (this.selection.size !== 1) return null;
+    const [onlyId] = this.selection;
+    const inst = this.circuit.getComponent(onlyId);
+    if (!inst) return null;
+    const def = getComponentType(inst.type);
+    return def ? { inst, def } : null;
+  }
+
   _onKeyDown(e) {
     const tag = document.activeElement?.tagName;
     const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
     if (e.code === 'Space' && !typing) { this.keys.space = true; this.canvas.classList.add('mode-pan'); }
     if (typing) return;
+
+    const focused = this._focusedInteractiveComponent();
+    if (focused?.def.onKeyDown) {
+      const next = focused.def.onKeyDown(focused.inst.state, focused.inst.params || {}, e);
+      if (next) {
+        focused.inst.state = next;
+        e.preventDefault();
+        return;
+      }
+    }
 
     const mod = e.ctrlKey || e.metaKey;
     if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? this.redo() : this.undo(); return; }
@@ -808,6 +933,11 @@ export class Editor {
 
   _onKeyUp(e) {
     if (e.code === 'Space') { this.keys.space = false; this.canvas.classList.remove('mode-pan'); }
+    const focused = this._focusedInteractiveComponent();
+    if (focused?.def.onKeyUp) {
+      const next = focused.def.onKeyUp(focused.inst.state, focused.inst.params || {}, e);
+      if (next) focused.inst.state = next;
+    }
   }
 
   // ---------------------------------------------------------------- actions
@@ -840,7 +970,7 @@ export class Editor {
     for (const w of this.circuit.wires) {
       if (compIds.has(w.from.compId) && compIds.has(w.to.compId)) tmp.addWire(w.clone());
     }
-    this.clipboard = JSON.parse(JSON.stringify(tmp.toPlain()));
+    this.clipboard = JSON.parse(JSON.stringify(tmp.toPlain(), stateReplacer), stateReviver);
     toast(`${compIds.size} Bauteil(e) kopiert`, 'info');
   }
 
@@ -865,6 +995,36 @@ export class Editor {
     this.selection = newSel;
     this.pushHistory();
     this.refreshPanels();
+  }
+
+  // Wird nach einer Parameteränderung aufgerufen, die Pins verändern kann (z.B. Bitbreite,
+  // oder beim Pixel-Display der Farbmodus, der DI von 1 auf 24 Bit umstellt). Entfernt
+  // Leitungen, die dadurch nicht mehr passen - sonst bleibt z.B. ein 1-Bit-Switch an einem
+  // inzwischen 24 Bit breiten Pin hängen: toInt() liefert dann still `null` (wegen der
+  // fehlenden/floatenden restlichen Bits) und Schreibzugriffe verschwinden kommentarlos,
+  // ohne dass irgendwo ein Fehler auftaucht.
+  pruneInvalidWiresFor(instId) {
+    const inst = this.circuit.getComponent(instId);
+    const def = inst && getComponentType(inst.type);
+    if (!inst || !def) return false;
+    const currentPins = new Map(def.pins(inst.params || {}).map((p) => [p.id, p]));
+    let removed = false;
+    for (const w of [...this.circuit.wires]) {
+      const onThis =
+        w.from.compId === instId ? { pinId: w.from.pinId, otherId: w.to.compId, otherPinId: w.to.pinId } :
+        w.to.compId === instId ? { pinId: w.to.pinId, otherId: w.from.compId, otherPinId: w.from.pinId } :
+        null;
+      if (!onThis) continue;
+      const pin = currentPins.get(onThis.pinId);
+      const otherInst = this.circuit.getComponent(onThis.otherId);
+      const otherDef = otherInst && getComponentType(otherInst.type);
+      const otherPin = otherDef && otherDef.pins(otherInst.params || {}).find((p) => p.id === onThis.otherPinId);
+      if (!pin || !otherPin || (pin.width ?? 1) !== (otherPin.width ?? 1)) {
+        this.circuit.removeWire(w.id);
+        removed = true;
+      }
+    }
+    return removed;
   }
 
   resetSimulation() {

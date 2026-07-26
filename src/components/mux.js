@@ -35,6 +35,11 @@ registerComponentType({
     const val = inputs[`in${idx}`] || new Array(width).fill(FLOATING);
     return { outputs: { out: val.slice() }, state: {} };
   },
+  help: {
+    summary: 'Multiplexer: schaltet einen von 2^SEL Dateneingängen abhängig vom SEL-Wert auf den Ausgang durch.',
+    usage: 'Select-Bits bestimmen, wie viele Dateneingänge es gibt (z.B. 2 Select-Bits = 4 Eingänge in0..in3). SEL mit dem Auswahlwert verbinden - Y liefert dann den Wert des ausgewählten Eingangs.',
+    pins: { sel: 'Auswahl, welcher Eingang durchgeschaltet wird (0-basiert).', out: 'Wert des ausgewählten Eingangs.' },
+  },
 });
 
 registerComponentType({
@@ -70,6 +75,11 @@ registerComponentType({
     }
     return { outputs, state: {} };
   },
+  help: {
+    summary: 'Demultiplexer: leitet D auf genau einen von 2^SEL Ausgängen weiter (der ausgewählte), alle anderen liefern 0.',
+    usage: 'SEL bestimmt, welcher Ausgang (out0..outN) aktuell D erhält; alle übrigen Ausgänge sind 0, nicht offen.',
+    pins: { d: 'Zu verteilendes Datensignal.', sel: 'Auswahl, welcher Ausgang D erhält.' },
+  },
 });
 
 registerComponentType({
@@ -101,6 +111,11 @@ registerComponentType({
     if (conflict) return { outputs: { sel: new Array(sel).fill(CONFLICT), valid: [CONFLICT] }, state: {} };
     if (idx === -1) return { outputs: { sel: new Array(sel).fill(0), valid: [0] }, state: {} };
     return { outputs: { sel: fromInt(idx, sel), valid: [1] }, state: {} };
+  },
+  help: {
+    summary: 'Prioritäts-Encoder: gibt die Nummer des höchstwertigen gesetzten Eingangs aus (Standard-Encoder-Verhalten, keine Codierung 1-aus-n nötig).',
+    usage: 'Mehrere Eingänge (in0..inN) anschließen. SEL zeigt die Nummer des höchsten Eingangs mit 1, VALID zeigt an, ob überhaupt ein Eingang gesetzt ist.',
+    pins: { sel: 'Nummer des höchstwertigen 1-Eingangs (0-basiert).', valid: '1, wenn mindestens ein Eingang 1 ist, sonst 0.' },
   },
 });
 
@@ -135,5 +150,10 @@ registerComponentType({
     const idx = en === 1 ? toInt(selBits) : null;
     for (let i = 0; i < n; i++) outputs[`out${i}`] = [idx === i ? 1 : 0];
     return { outputs, state: {} };
+  },
+  help: {
+    summary: 'Decoder: setzt genau einen von 2^SEL Ausgängen auf 1 (den durch SEL adressierten), sofern EN=1.',
+    usage: 'Typisch zur Adress-Dekodierung: SEL an eine Adresse anschließen, EN als Chip-Select, jeder Ausgang aktiviert dann z.B. ein anderes Bauteil.',
+    pins: { sel: 'Adresse/Auswahl.', en: 'Enable: bei 0 sind alle Ausgänge 0.' },
   },
 });

@@ -10,6 +10,21 @@ import { loadFromStorage } from './core/library.js';
 import { deserializeCircuit } from './core/fileformat.js';
 import { showDialog, showShortcuts } from './ui/dialog.js';
 
+// Minimale Fallback-Styles für den neuen "Erklärung"-Abschnitt im Eigenschaften-Panel.
+// Eigenständig hier injiziert (statt in style.css), da diese Datei hier nicht vorlag -
+// bei Bedarf gerne 1:1 nach style.css verschieben und diesen Block entfernen.
+(function injectHelpPanelStyles() {
+  const style = document.createElement('style');
+  style.textContent = `
+    .prop-help-summary { opacity: 0.85; font-size: 0.92em; line-height: 1.4; margin: 4px 0 8px; }
+    .prop-help-usage { font-size: 0.9em; line-height: 1.4; margin: 0 0 10px; opacity: 0.8; }
+    .prop-help-pins { width: 100%; border-collapse: collapse; font-size: 0.82em; }
+    .prop-help-pins th, .prop-help-pins td { text-align: left; padding: 3px 6px; border-bottom: 1px solid rgba(255,255,255,0.08); vertical-align: top; }
+    .prop-help-pins th { opacity: 0.6; font-weight: 500; }
+  `;
+  document.head.appendChild(style);
+})();
+
 const AUTOSAVE_KEY = 'logicforge:autosave:v1';
 
 // 1) gespeicherte "Meine Komponenten" (aus vorherigen Sitzungen) laden,
@@ -222,6 +237,10 @@ function renderInstanceProperties(inst) {
     propertiesBodyEl.appendChild(paramSection);
   }
 
+  if (def?.help) {
+    propertiesBodyEl.appendChild(renderHelpSection(def, inst));
+  }
+
   const actions = document.createElement('div');
   actions.className = 'prop-section';
   actions.innerHTML = '<div class="prop-title">Aktionen</div>';
@@ -239,6 +258,31 @@ function renderInstanceProperties(inst) {
   propertiesBodyEl.appendChild(actions);
   row.querySelector('#prop-rotate').onclick = () => editor.rotateSelection();
   row.querySelector('#prop-delete').onclick = () => editor.deleteSelection();
+}
+
+// Baut den "Erklärung"-Abschnitt im Eigenschaften-Panel: Kurzbeschreibung, Verwendung
+// und eine Pin-Tabelle (Richtung + Breite direkt aus den aktuellen Pins des Bauteils,
+// Beschreibungstext aus def.help.pins, falls vorhanden).
+function renderHelpSection(def, inst) {
+  const section = document.createElement('div');
+  section.className = 'prop-section prop-help';
+  const pins = def.pins(inst.params || {});
+  const pinRows = pins.map((p) => {
+    const desc = def.help.pins?.[p.id] || '';
+    const dirLabel = p.dir === 'in' ? 'Eingang' : 'Ausgang';
+    return `<tr><td>${escapeHtml(p.label || p.id)}</td><td>${dirLabel}</td><td>${p.width}</td><td>${escapeHtml(desc)}</td></tr>`;
+  }).join('');
+  section.innerHTML = `
+    <div class="prop-title">Erklärung</div>
+    ${def.help.summary ? `<p class="prop-help-summary">${escapeHtml(def.help.summary)}</p>` : ''}
+    ${def.help.usage ? `<p class="prop-help-usage"><strong>Verwendung:</strong> ${escapeHtml(def.help.usage)}</p>` : ''}
+    ${pins.length ? `
+      <table class="prop-help-pins">
+        <thead><tr><th>Pin</th><th>Richtung</th><th>Breite</th><th>Beschreibung</th></tr></thead>
+        <tbody>${pinRows}</tbody>
+      </table>` : ''}
+  `;
+  return section;
 }
 
 function renderWireProperties() {
