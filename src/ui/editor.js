@@ -71,13 +71,23 @@ export class Editor {
     this.historyIndex = -1;
 
     this.drag = null; // { kind: 'move'|'pan'|'wire-seg'|'marquee', ... }
-    // Unified pointer-based multi-touch tracking (see _bindEvents / _onPointerDown):
-    // iOS Safari fires both TouchEvents and PointerEvents for the same fingers, so
-    // pinch/pan is handled entirely through pointer events, gating out normal
-    // single-pointer logic (drag/marquee/wire-drafting) whenever 2+ touch pointers
-    // are active - separate touchstart/move listeners would otherwise fight it frame-by-frame.
-    this._touchPointers = new Map(); // pointerId -> { x, y } (client coords, touch pointers only)
-    this._pinch = null; // { ids: [id0, id1], startDist, startZoom, startTime, startMidScreen, compAtStart }
+    // Two-finger pinch/pan is driven ENTIRELY by native TouchEvents (see _onTouchStart/
+    // _onTouchMove/_onTouchEnd below), not by Pointer Events. Reason: iOS Safari's
+    // PointerEvent delivery for *simultaneous* multi-touch is flaky - each finger's
+    // pointermove can arrive slightly late/out-of-order relative to the other, so reading
+    // "current position of finger A" and "current position of finger B" from two
+    // independently-updated map entries can combine stale + fresh data in the same
+    // computation, which is exactly what made two-finger pan janky/dead while pinch-zoom
+    // (which tolerates a bit of lag much better) looked like it worked. A TouchEvent's
+    // `touches` list bundles every active finger's freshly-sampled coordinates into one
+    // atomic event, so reading both fingers out of the SAME touchmove event guarantees
+    // they're from the same instant.
+    // Pointer Events are still used for single-finger interaction (drag/marquee/wire-draft)
+    // - Safari's pointer events for a single touch are reliable, it's only the simultaneous
+    // multi-touch case that's buggy. `_activeTouchIds` just counts fingers so pointerdown
+    // can bail out of single-finger gestures the instant a second finger touches down.
+    this._activeTouchIds = new Set(); // pointerId set, touch pointers only (counting only, no coords)
+    this._pinch = null; // { id0, id1, startDist, startZoom, startTime, startMidScreen, compAtStart }
     this._longPressTimer = null;
     this.keys = { space: false };
     this.activeCategory = null;
@@ -316,14 +326,14 @@ export class Editor {
     c.addEventListener('contextmenu', (e) => this._onContextMenu(e));
     c.addEventListener('dblclick', (e) => this._onDblClick(e));
 
-    // Pinch-Zoom + Pan werden komplett über Pointer-Events erledigt (siehe
-    // _onPointerDown/_onPointerMove) - PointerEvents und TouchEvents feuern auf iOS
-    // Safari für dieselben physischen Finger parallel, und zwei getrennte
-    // Implementierungen würden sich gegenseitig die Kamera-Bewegung wegrechnen.
-    // Diese Touch-Listener tun nichts weiter als `preventDefault()`, damit der
-    // Browser bei 2+ Fingern nicht selbst pannt/zoomt/scrollt.
-    c.addEventListener('touchstart', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
-    c.addEventListener('touchmove', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+    // Pinch-Zoom + Zwei-Finger-Pan: komplett über native TouchEvents (siehe Kommentar beim
+    // Konstruktor / _onTouchStart / _onTouchMove / _onTouchEnd) statt über Pointer-Events -
+    // die liefern auf iOS Safari für gleichzeitige Multi-Touch-Gesten zuverlässigere,
+    // synchron zueinander gültige Fingerpositionen.
+    c.addEventListener('touchstart', (e) => this._onTouchStart(e), { passive: false });
+    c.addEventListener('touchmove', (e) => this._onTouchMove(e), { passive: false });
+    c.addEventListener('touchend', (e) => this._onTouchEnd(e), { passive: false });
+    c.addEventListener('touchcancel', (e) => this._onTouchEnd(e, true), { passive: false });
 
     window.addEventListener('keydown', (e) => this._onKeyDown(e));
     window.addEventListener('keyup', (e) => this._onKeyUp(e));
@@ -402,13 +412,15 @@ export class Editor {
     const wp = screenToWorld(this.camera, sp.x, sp.y);
     this.lastMouseWorld = wp;
 
-    // Zweiter (oder weiterer) Finger: schaltet in den Pinch/Pan-Modus um und schluckt
-    // dieses Event komplett - jede laufende Ein-Finger-Geste wird abgebrochen, damit sie
-    // nicht mit der Pinch-Berechnung in _onPointerMove kollidiert.
+    // Zweiter (oder weiterer) Finger: die eigentliche Pinch/Pan-Berechnung passiert komplett
+    // in _onTouchStart/_onTouchMove (native TouchEvents, siehe Kommentar im Konstruktor).
+    // Hier wird nur mitgezählt, wie viele Finger aktiv sind, damit eine schon laufende
+    // Ein-Finger-Geste (Drag/Marquee/Kabel-Entwurf) sofort abgebrochen wird, sobald ein
+    // zweiter Finger dazukommt - unabhängig davon, in welcher Reihenfolge touchstart und
+    // pointerdown für diesen zweiten Finger feuern.
     if (e.pointerType === 'touch') {
-      this._touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      const ids = [...this._touchPointers.keys()];
-      if (ids.length >= 2) {
+      this._activeTouchIds.add(e.pointerId);
+      if (this._activeTouchIds.size >= 2 || this._pinch) {
         this._clearLongPressTimer();
         this.drag = null;
         this.marquee = null;
@@ -416,19 +428,6 @@ export class Editor {
           this.wireDraft = null;
           this.canvas.classList.remove('mode-wiring');
         }
-        const [id0, id1] = ids.slice(0, 2);
-        const p0 = this._touchPointers.get(id0), p1 = this._touchPointers.get(id1);
-        const rect = this.canvas.getBoundingClientRect();
-        const midScreen = { x: (p0.x + p1.x) / 2 - rect.left, y: (p0.y + p1.y) / 2 - rect.top };
-        const midWorld = screenToWorld(this.camera, midScreen.x, midScreen.y);
-        this._pinch = {
-          ids: [id0, id1],
-          startDist: Math.hypot(p1.x - p0.x, p1.y - p0.y) || 1,
-          startZoom: this.camera.zoom,
-          startTime: performance.now(),
-          startMidScreen: midScreen,
-          compAtStart: this._findComponentAt(midWorld.x, midWorld.y),
-        };
         return;
       }
     }
@@ -578,31 +577,9 @@ export class Editor {
   }
 
   _onPointerMove(e) {
-    if (e.pointerType === 'touch' && this._touchPointers.has(e.pointerId)) {
-      this._touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    }
-
-    if (this._pinch) {
-      const [id0, id1] = this._pinch.ids;
-      if (e.pointerId === id0 || e.pointerId === id1) {
-        const p0 = this._touchPointers.get(id0), p1 = this._touchPointers.get(id1);
-        if (p0 && p1) {
-          const rect = this.canvas.getBoundingClientRect();
-          const mid = { x: (p0.x + p1.x) / 2 - rect.left, y: (p0.y + p1.y) / 2 - rect.top };
-          const dist = Math.hypot(p1.x - p0.x, p1.y - p0.y) || 1;
-          // Weltpunkt, der aktuell (mit der noch alten Kamera) unter dem Fingermittelpunkt liegt -
-          // der bleibt nach dem Update exakt unter den Fingern (Zoom UND Pan in einem Rutsch).
-          const before = screenToWorld(this.camera, mid.x, mid.y);
-          const factor = dist / this._pinch.startDist;
-          this.camera.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this._pinch.startZoom * factor));
-          this.camera.panX = mid.x - before.x * GRID * this.camera.zoom;
-          this.camera.panY = mid.y - before.y * GRID * this.camera.zoom;
-        }
-      }
-      // Während ein Pinch läuft, wird jede normale Ein-Finger-Logik komplett unterdrückt -
-      // sonst kämpfen pointermove-Events beider Finger frame-für-frame gegeneinander.
-      return;
-    }
+    // Während ein Zwei-Finger-Pinch läuft, treibt ausschließlich _onTouchMove die Kamera an
+    // (siehe Kommentar im Konstruktor) - jede normale Ein-Finger-Logik hier wird unterdrückt.
+    if (this._pinch) return;
 
     const sp = this._screenPos(e);
     const wp = screenToWorld(this.camera, sp.x, sp.y);
@@ -716,38 +693,16 @@ export class Editor {
   
   _onPointerUp(e, isCancel = false) {
     if (e.pointerType === 'touch') {
-      this._touchPointers.delete(e.pointerId);
+      this._activeTouchIds.delete(e.pointerId);
       this._clearLongPressTimer();
     }
 
-    if (this._pinch) {
-      const wasPinchFinger = this._pinch.ids.includes(e.pointerId);
-      if (wasPinchFinger) {
-        // Zwei-Finger-Tippen (kurz, kaum Bewegung, kaum Zoom-Änderung) auf einem Bauteil
-        // öffnet dessen Parameter - Ersatz für Rechtsklick auf Touch-Geräten.
-        if (!isCancel && this._pinch.compAtStart) {
-          const elapsed = performance.now() - this._pinch.startTime;
-          const zoomRatio = Math.abs(this.camera.zoom - this._pinch.startZoom) / this._pinch.startZoom;
-          const remaining = [...this._touchPointers.values()];
-          let stillEnoughMid = true;
-          if (remaining.length) {
-            const rect = this.canvas.getBoundingClientRect();
-            const p = remaining[0];
-            const curScreen = { x: p.x - rect.left, y: p.y - rect.top };
-            const moved = Math.hypot(curScreen.x - this._pinch.startMidScreen.x, curScreen.y - this._pinch.startMidScreen.y);
-            stillEnoughMid = moved < 24;
-          }
-          if (elapsed < 350 && zoomRatio < 0.06 && stillEnoughMid) {
-            this._openParamsAt(null, this._pinch.compAtStart);
-          }
-        }
-        this._pinch = null;
-      }
-      // Solange (noch) ein Pinch aktiv war, bekommt dieses Loslassen keine normale
-      // Klick-/Drag-Semantik - ein evtl. verbleibender Finger startet erst bei seinem
-      // eigenen nächsten pointerdown wieder eine Ein-Finger-Geste.
-      return;
-    }
+    // Solange (noch) ein Pinch aktiv ist/war, bekommt dieses Loslassen keine normale
+    // Klick-/Drag-Semantik - Release-Erkennung und die "Zwei-Finger-Tippen öffnet
+    // Parameter"-Geste laufen komplett über _onTouchEnd (siehe Kommentar im Konstruktor).
+    // Ein evtl. verbleibender Finger startet erst bei seinem eigenen nächsten
+    // pointerdown wieder eine Ein-Finger-Geste.
+    if (this._pinch) return;
 
     if (isCancel) {
       // System hat die Geste abgebrochen (z.B. iOS-Wischgeste) - laufende Drags/Entwürfe
@@ -864,6 +819,86 @@ export class Editor {
       if (def?.onPointerUp) inst.state = def.onPointerUp(inst.state, inst.params || {});
       this._buttonPressedId = null;
     }
+  }
+
+  // ---------------------------------------------------------------- touch (pinch/pan)
+  //
+  // All two-finger camera control lives here, driven by native TouchEvents rather than
+  // Pointer Events - see the long comment in the constructor for why. The key property
+  // this relies on: within a single touchmove event, `e.touches` contains every active
+  // finger's coordinates sampled at the SAME instant, so reading both pinch fingers out of
+  // one event (instead of two independently-arriving pointermove events) can't combine a
+  // stale position for one finger with a fresh position for the other.
+
+  _onTouchStart(e) {
+    if (e.touches.length < 2) return; // single finger stays on Pointer Events
+    e.preventDefault();
+    this._clearLongPressTimer();
+    this.drag = null;
+    this.marquee = null;
+    if (this.wireDraft) {
+      this.wireDraft = null;
+      this.canvas.classList.remove('mode-wiring');
+    }
+
+    const t0 = e.touches[0], t1 = e.touches[1];
+    const rect = this.canvas.getBoundingClientRect();
+    const midScreen = { x: (t0.clientX + t1.clientX) / 2 - rect.left, y: (t0.clientY + t1.clientY) / 2 - rect.top };
+    const midWorld = screenToWorld(this.camera, midScreen.x, midScreen.y);
+    this._pinch = {
+      id0: t0.identifier, id1: t1.identifier,
+      startDist: Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY) || 1,
+      startZoom: this.camera.zoom,
+      startTime: performance.now(),
+      startMidScreen: midScreen,
+      compAtStart: this._findComponentAt(midWorld.x, midWorld.y),
+    };
+  }
+
+  _onTouchMove(e) {
+    if (!this._pinch) return;
+    const touches = Array.from(e.touches);
+    const t0 = touches.find((t) => t.identifier === this._pinch.id0);
+    const t1 = touches.find((t) => t.identifier === this._pinch.id1);
+    if (!t0 || !t1) return; // one of the two pinch fingers already lifted - wait for touchend
+    e.preventDefault();
+
+    const rect = this.canvas.getBoundingClientRect();
+    const mid = { x: (t0.clientX + t1.clientX) / 2 - rect.left, y: (t0.clientY + t1.clientY) / 2 - rect.top };
+    const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY) || 1;
+    // Weltpunkt, der aktuell (mit der noch alten Kamera) unter dem Fingermittelpunkt liegt -
+    // bleibt nach dem Update exakt unter den Fingern (Zoom UND Pan in einem Rutsch).
+    const before = screenToWorld(this.camera, mid.x, mid.y);
+    const factor = dist / this._pinch.startDist;
+    this.camera.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this._pinch.startZoom * factor));
+    this.camera.panX = mid.x - before.x * GRID * this.camera.zoom;
+    this.camera.panY = mid.y - before.y * GRID * this.camera.zoom;
+  }
+
+  _onTouchEnd(e, isCancel = false) {
+    if (!this._pinch) return;
+    // The pinch only truly ends once one of its two tracked fingers actually lifts - a
+    // third finger touching down or an unrelated finger lifting doesn't count.
+    const stillDown = new Set(Array.from(e.touches).map((t) => t.identifier));
+    if (stillDown.has(this._pinch.id0) && stillDown.has(this._pinch.id1)) return;
+
+    // Zwei-Finger-Tippen (kurz, kaum Bewegung, kaum Zoom-Änderung) auf einem Bauteil öffnet
+    // dessen Parameter - Ersatz für Rechtsklick auf Touch-Geräten.
+    if (!isCancel && this._pinch.compAtStart) {
+      const elapsed = performance.now() - this._pinch.startTime;
+      const zoomRatio = Math.abs(this.camera.zoom - this._pinch.startZoom) / this._pinch.startZoom;
+      const rect = this.canvas.getBoundingClientRect();
+      const remaining = Array.from(e.touches)[0];
+      let stillEnoughMid = true;
+      if (remaining) {
+        const curScreen = { x: remaining.clientX - rect.left, y: remaining.clientY - rect.top };
+        stillEnoughMid = Math.hypot(curScreen.x - this._pinch.startMidScreen.x, curScreen.y - this._pinch.startMidScreen.y) < 24;
+      }
+      if (elapsed < 350 && zoomRatio < 0.06 && stillEnoughMid) {
+        this._openParamsAt(null, this._pinch.compAtStart);
+      }
+    }
+    this._pinch = null;
   }
 
   _pinsCompatible(instA, pinA, instB, pinB) {
