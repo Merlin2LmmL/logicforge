@@ -90,6 +90,7 @@ export function render(ctx, w, h, S) {
       wireValues,
       circuit,
       time,
+      wireDraft,
     });
   }
 
@@ -329,7 +330,14 @@ function drawComponent(ctx, camera, inst, opts) {
       const connected = pin.dir === 'out'
         ? opts.circuit.wiresFrom(inst.id, pin.id).length > 0
         : !!opts.circuit.wireInto(inst.id, pin.id);
+      // Während ein Kabel gezogen wird: Labels von Pins, die ohnehin kein gültiges Ziel
+      // sind (falsche Richtung, oder Eingang bereits belegt), abdunkeln - so sieht man
+      // beim Ziehen auf einen Blick, wo überhaupt angeschlossen werden kann.
+      const dimmed = opts.wireDraft && !isPinEligibleForDraft(inst, pin, connected, opts.wireDraft);
+      ctx.save();
+      if (dimmed) ctx.globalAlpha *= 0.35;
       drawPinLabel(ctx, sp, pin, pos.side, camera.zoom, connected);
+      ctx.restore();
     }
   }
 
@@ -356,6 +364,17 @@ function drawComponent(ctx, camera, inst, opts) {
     ctx.fillText(inst.label || '', topLeft.x + (effW * GRID * camera.zoom) / 2, topLeft.y + 2);
     ctx.restore();
   }
+}
+
+// Grobe (rein visuelle) Einschätzung, ob ein Pin gerade ein plausibles Ziel für den
+// laufenden Kabel-Entwurf ist - keine Breiten-/Typ-Prüfung wie beim tatsächlichen
+// Verbinden, nur genug für ein hilfreiches Abdunkeln der übrigen Pins.
+function isPinEligibleForDraft(inst, pin, connected, wireDraft) {
+  const { startInst, startPin } = wireDraft;
+  if (inst.id === startInst.id && pin.id === startPin.id) return true; // der Start-Pin selbst
+  if (pin.dir === startPin.dir) return false; // gleiche Richtung kann nie verbunden werden
+  if (pin.dir === 'in' && connected) return false; // Eingang bereits belegt
+  return true;
 }
 
 function wireValueInto(circuit, wireValues, compId, pinId) {

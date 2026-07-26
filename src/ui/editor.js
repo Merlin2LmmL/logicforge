@@ -71,6 +71,14 @@ export class Editor {
     this.historyIndex = -1;
 
     this.drag = null; // { kind: 'move'|'pan'|'wire-seg'|'marquee', ... }
+    // Unified pointer-based multi-touch tracking (see _bindEvents / _onPointerDown):
+    // iOS Safari fires both TouchEvents and PointerEvents for the same fingers, so
+    // pinch/pan is handled entirely through pointer events, gating out normal
+    // single-pointer logic (drag/marquee/wire-drafting) whenever 2+ touch pointers
+    // are active - separate touchstart/move listeners would otherwise fight it frame-by-frame.
+    this._touchPointers = new Map(); // pointerId -> { x, y } (client coords, touch pointers only)
+    this._pinch = null; // { ids: [id0, id1], startDist, startZoom, startTime, startMidScreen, compAtStart }
+    this._longPressTimer = null;
     this.keys = { space: false };
     this.activeCategory = null;
     this.lastMouseWorld = { x: 0, y: 0 };
@@ -102,7 +110,7 @@ export class Editor {
   _resizeCanvas() {
     // Verhindert, dass der Browser bei Touch-Eingaben selbst pannt/zoomt (Pinch-Zoom der
     // Seite, Doppeltipp-Zoom, Scroll-Bounce) - wir wollen Pinch/Pan komplett selbst
-    // steuern (siehe _onTouchStart/_onTouchMove).
+    // steuern (siehe _onPointerDown/_onPointerMove, Abschnitt "pointer-based pinch").
     this.canvas.style.touchAction = 'none';
     const rect = this.dom.canvasWrap.getBoundingClientRect();
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -300,16 +308,22 @@ export class Editor {
     c.addEventListener('pointerdown', (e) => this._onPointerDown(e));
     window.addEventListener('pointermove', (e) => this._onPointerMove(e));
     window.addEventListener('pointerup', (e) => this._onPointerUp(e));
+    // iOS fires `pointercancel` instead of `pointerup` for some system gestures
+    // (e.g. the fingers involved get reinterpreted by the OS) - treat it the same
+    // as a pointer going up so pinch state / drags / long-press timers don't get stuck.
+    window.addEventListener('pointercancel', (e) => this._onPointerUp(e, true));
     c.addEventListener('wheel', (e) => this._onWheel(e), { passive: false });
     c.addEventListener('contextmenu', (e) => this._onContextMenu(e));
     c.addEventListener('dblclick', (e) => this._onDblClick(e));
 
-    // Zwei-Finger-Geste = Pinch-Zoom + Pan (ein Finger läuft weiter normal über die
-    // Pointer-Events, z.B. zum Verschieben von Bauteilen oder Ziehen von Kabeln).
-    c.addEventListener('touchstart', (e) => this._onTouchStart(e), { passive: false });
-    c.addEventListener('touchmove', (e) => this._onTouchMove(e), { passive: false });
-    c.addEventListener('touchend', (e) => this._onTouchEnd(e), { passive: false });
-    c.addEventListener('touchcancel', (e) => this._onTouchEnd(e), { passive: false });
+    // Pinch-Zoom + Pan werden komplett über Pointer-Events erledigt (siehe
+    // _onPointerDown/_onPointerMove) - PointerEvents und TouchEvents feuern auf iOS
+    // Safari für dieselben physischen Finger parallel, und zwei getrennte
+    // Implementierungen würden sich gegenseitig die Kamera-Bewegung wegrechnen.
+    // Diese Touch-Listener tun nichts weiter als `preventDefault()`, damit der
+    // Browser bei 2+ Fingern nicht selbst pannt/zoomt/scrollt.
+    c.addEventListener('touchstart', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+    c.addEventListener('touchmove', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
 
     window.addEventListener('keydown', (e) => this._onKeyDown(e));
     window.addEventListener('keyup', (e) => this._onKeyUp(e));
@@ -327,13 +341,97 @@ export class Editor {
     if (this.wireDraft) {
       this.wireDraft = null;
       this.canvas.classList.remove('mode-wiring');
+      return;
     }
+    // Ansonsten: Rechtsklick auf ein Bauteil öffnet dessen Parameter (Desktop-Äquivalent
+    // zum Lang-Drücken / Zwei-Finger-Tippen auf Touch-Geräten, siehe _openParamsAt).
+    const sp = this._screenPos(e);
+    const wp = screenToWorld(this.camera, sp.x, sp.y);
+    this._openParamsAt(wp);
+  }
+
+  // ---------------------------------------------------------------- component parameters dialog
+
+  // Öffnet die Parameter eines Bauteils in einem Dialog. `instMaybe` überspringt die
+  // Trefferprüfung (z.B. wenn der Aufrufer das Bauteil bereits kennt, etwa bei
+  // Lang-Drücken/Zwei-Finger-Tippen, wo der Fingerpunkt beim Öffnen ungenau sein kann).
+  _openParamsAt(wp, instMaybe) {
+    const inst = instMaybe || (wp && this._findComponentAt(wp.x, wp.y));
+    if (!inst) return;
+    const def = getComponentType(inst.type);
+    if (!def) return;
+    this.selection = new Set([inst.id]);
+    this.refreshPanels();
+    this._openParamsDialog(inst, def);
+  }
+
+  async _openParamsDialog(inst, def) {
+    const schema = def.paramsSchema || [];
+    if (!schema.length) {
+      toast(`„${inst.label || def.label}“ hat keine einstellbaren Parameter`, 'info');
+      return;
+    }
+    const fields = schema.map((s) => {
+      const value = inst.params?.[s.key] ?? s.default;
+      if (s.kind === 'select') return { key: s.key, label: s.label, type: 'select', value, options: s.options };
+      if (s.kind === 'bool') return { key: s.key, label: s.label, type: 'checkbox', value };
+      if (s.kind === 'int') return { key: s.key, label: s.label, type: 'number', value, min: s.min, max: s.max, step: s.step ?? 1 };
+      return { key: s.key, label: s.label, type: 'text', value };
+    });
+    const result = await showDialog({ title: `${inst.label || def.label} – Parameter`, fields, submitLabel: 'Übernehmen' });
+    if (!result) return;
+    const newParams = { ...inst.params };
+    for (const s of schema) {
+      if (!Object.prototype.hasOwnProperty.call(result, s.key)) continue;
+      let v = result[s.key];
+      if (s.kind === 'int') v = Math.max(s.min ?? -Infinity, Math.min(s.max ?? Infinity, parseInt(v, 10) || 0));
+      if (s.kind === 'bool') v = !!v;
+      newParams[s.key] = v;
+    }
+    inst.params = newParams;
+    this.pushHistory();
+    this.refreshPanels();
+  }
+
+  _clearLongPressTimer() {
+    if (this._longPressTimer) { clearTimeout(this._longPressTimer); this._longPressTimer = null; }
   }
 
   _onPointerDown(e) {
     const sp = this._screenPos(e);
     const wp = screenToWorld(this.camera, sp.x, sp.y);
     this.lastMouseWorld = wp;
+
+    // Zweiter (oder weiterer) Finger: schaltet in den Pinch/Pan-Modus um und schluckt
+    // dieses Event komplett - jede laufende Ein-Finger-Geste wird abgebrochen, damit sie
+    // nicht mit der Pinch-Berechnung in _onPointerMove kollidiert.
+    if (e.pointerType === 'touch') {
+      this._touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      const ids = [...this._touchPointers.keys()];
+      if (ids.length >= 2) {
+        this._clearLongPressTimer();
+        this.drag = null;
+        this.marquee = null;
+        if (this.wireDraft) {
+          this.wireDraft = null;
+          this.canvas.classList.remove('mode-wiring');
+        }
+        const [id0, id1] = ids.slice(0, 2);
+        const p0 = this._touchPointers.get(id0), p1 = this._touchPointers.get(id1);
+        const rect = this.canvas.getBoundingClientRect();
+        const midScreen = { x: (p0.x + p1.x) / 2 - rect.left, y: (p0.y + p1.y) / 2 - rect.top };
+        const midWorld = screenToWorld(this.camera, midScreen.x, midScreen.y);
+        this._pinch = {
+          ids: [id0, id1],
+          startDist: Math.hypot(p1.x - p0.x, p1.y - p0.y) || 1,
+          startZoom: this.camera.zoom,
+          startTime: performance.now(),
+          startMidScreen: midScreen,
+          compAtStart: this._findComponentAt(midWorld.x, midWorld.y),
+        };
+        return;
+      }
+    }
 
     // middle-mouse or space-drag => pan
     if (e.button === 1 || (e.button === 0 && this.keys.space)) {
@@ -435,6 +533,19 @@ export class Editor {
         kind: 'move', startScreen: sp, startWorld: wp, moved: false,
         startPositions, wireSnapshots, clickedInst: compHit, clickedDef: def,
       };
+      // Auf Touch-Geräten gibt es kein Rechtsklick - Lang-Drücken (ohne zu bewegen)
+      // öffnet stattdessen die Parameter des Bauteils.
+      if (e.pointerType === 'touch') {
+        this._clearLongPressTimer();
+        const heldId = compHit.id;
+        this._longPressTimer = setTimeout(() => {
+          this._longPressTimer = null;
+          if (this.drag && this.drag.kind === 'move' && !this.drag.moved && this.drag.clickedInst?.id === heldId) {
+            this.drag = null;
+            this._openParamsAt(null, compHit);
+          }
+        }, 500);
+      }
       return;
     }
 
@@ -467,6 +578,32 @@ export class Editor {
   }
 
   _onPointerMove(e) {
+    if (e.pointerType === 'touch' && this._touchPointers.has(e.pointerId)) {
+      this._touchPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+
+    if (this._pinch) {
+      const [id0, id1] = this._pinch.ids;
+      if (e.pointerId === id0 || e.pointerId === id1) {
+        const p0 = this._touchPointers.get(id0), p1 = this._touchPointers.get(id1);
+        if (p0 && p1) {
+          const rect = this.canvas.getBoundingClientRect();
+          const mid = { x: (p0.x + p1.x) / 2 - rect.left, y: (p0.y + p1.y) / 2 - rect.top };
+          const dist = Math.hypot(p1.x - p0.x, p1.y - p0.y) || 1;
+          // Weltpunkt, der aktuell (mit der noch alten Kamera) unter dem Fingermittelpunkt liegt -
+          // der bleibt nach dem Update exakt unter den Fingern (Zoom UND Pan in einem Rutsch).
+          const before = screenToWorld(this.camera, mid.x, mid.y);
+          const factor = dist / this._pinch.startDist;
+          this.camera.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this._pinch.startZoom * factor));
+          this.camera.panX = mid.x - before.x * GRID * this.camera.zoom;
+          this.camera.panY = mid.y - before.y * GRID * this.camera.zoom;
+        }
+      }
+      // Während ein Pinch läuft, wird jede normale Ein-Finger-Logik komplett unterdrückt -
+      // sonst kämpfen pointermove-Events beider Finger frame-für-frame gegeneinander.
+      return;
+    }
+
     const sp = this._screenPos(e);
     const wp = screenToWorld(this.camera, sp.x, sp.y);
     this.lastMouseWorld = wp;
@@ -521,7 +658,10 @@ export class Editor {
 
     if (this.drag?.kind === 'move') {
       const dxPx = sp.x - this.drag.startScreen.x, dyPx = sp.y - this.drag.startScreen.y;
-      if (!this.drag.moved && Math.hypot(dxPx, dyPx) > MOVE_THRESHOLD_PX) this.drag.moved = true;
+      if (!this.drag.moved && Math.hypot(dxPx, dyPx) > MOVE_THRESHOLD_PX) {
+        this.drag.moved = true;
+        this._clearLongPressTimer();
+      }
       if (this.drag.moved) {
         const dx = Math.round(wp.x - this.drag.startWorld.x);
         const dy = Math.round(wp.y - this.drag.startWorld.y);
@@ -574,7 +714,53 @@ export class Editor {
   }
   
   
-  _onPointerUp(e) {
+  _onPointerUp(e, isCancel = false) {
+    if (e.pointerType === 'touch') {
+      this._touchPointers.delete(e.pointerId);
+      this._clearLongPressTimer();
+    }
+
+    if (this._pinch) {
+      const wasPinchFinger = this._pinch.ids.includes(e.pointerId);
+      if (wasPinchFinger) {
+        // Zwei-Finger-Tippen (kurz, kaum Bewegung, kaum Zoom-Änderung) auf einem Bauteil
+        // öffnet dessen Parameter - Ersatz für Rechtsklick auf Touch-Geräten.
+        if (!isCancel && this._pinch.compAtStart) {
+          const elapsed = performance.now() - this._pinch.startTime;
+          const zoomRatio = Math.abs(this.camera.zoom - this._pinch.startZoom) / this._pinch.startZoom;
+          const remaining = [...this._touchPointers.values()];
+          let stillEnoughMid = true;
+          if (remaining.length) {
+            const rect = this.canvas.getBoundingClientRect();
+            const p = remaining[0];
+            const curScreen = { x: p.x - rect.left, y: p.y - rect.top };
+            const moved = Math.hypot(curScreen.x - this._pinch.startMidScreen.x, curScreen.y - this._pinch.startMidScreen.y);
+            stillEnoughMid = moved < 24;
+          }
+          if (elapsed < 350 && zoomRatio < 0.06 && stillEnoughMid) {
+            this._openParamsAt(null, this._pinch.compAtStart);
+          }
+        }
+        this._pinch = null;
+      }
+      // Solange (noch) ein Pinch aktiv war, bekommt dieses Loslassen keine normale
+      // Klick-/Drag-Semantik - ein evtl. verbleibender Finger startet erst bei seinem
+      // eigenen nächsten pointerdown wieder eine Ein-Finger-Geste.
+      return;
+    }
+
+    if (isCancel) {
+      // System hat die Geste abgebrochen (z.B. iOS-Wischgeste) - laufende Drags/Entwürfe
+      // sauber verwerfen statt sie so zu behandeln, als wäre regulär losgelassen worden.
+      this.drag = null;
+      if (this.wireDraft) {
+        this.wireDraft = null;
+        this.canvas.classList.remove('mode-wiring');
+      }
+      this.canvas.classList.remove('mode-panning');
+      return;
+    }
+
     const _upSp = this._screenPos(e);
     const _upWp = screenToWorld(this.camera, _upSp.x, _upSp.y);
     if (this.drag?.kind === 'wire-seg') {
@@ -826,52 +1012,6 @@ export class Editor {
     this.camera.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this.camera.zoom * factor));
     this.camera.panX = sp.x - before.x * GRID * this.camera.zoom;
     this.camera.panY = sp.y - before.y * GRID * this.camera.zoom;
-  }
-
-  // ---------------------------------------------------------------- touch (pinch/pan)
-
-  _touchDist(t0, t1) {
-    return Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
-  }
-
-  _touchMid(t0, t1) {
-    const rect = this.canvas.getBoundingClientRect();
-    return { x: (t0.clientX + t1.clientX) / 2 - rect.left, y: (t0.clientY + t1.clientY) / 2 - rect.top };
-  }
-
-  _onTouchStart(e) {
-    if (e.touches.length < 2) return;
-    e.preventDefault();
-    // Eine laufende Ein-Finger-Aktion (Verschieben, Kabel ziehen, Marquee, ...) wird
-    // durch den zweiten Finger abgebrochen, damit sie nicht mit Pinch/Pan kollidiert.
-    this.drag = null;
-    this.marquee = null;
-    if (this.wireDraft) {
-      this.wireDraft = null;
-      this.canvas.classList.remove('mode-wiring');
-    }
-    const [t0, t1] = e.touches;
-    this._touchState = { startDist: this._touchDist(t0, t1) || 1, startZoom: this.camera.zoom };
-  }
-
-  _onTouchMove(e) {
-    if (e.touches.length < 2 || !this._touchState) return;
-    e.preventDefault();
-    const [t0, t1] = e.touches;
-    const dist = this._touchDist(t0, t1);
-    const mid = this._touchMid(t0, t1);
-    // Weltpunkt, der aktuell (mit der noch alten Kamera) unter dem Fingermittelpunkt liegt -
-    // der bleibt nach dem Update exakt unter den Fingern, das ergibt Zoom UND Pan
-    // (Fingerbewegung ohne Abstandsänderung) in einem Rutsch.
-    const before = screenToWorld(this.camera, mid.x, mid.y);
-    const factor = dist / this._touchState.startDist;
-    this.camera.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this._touchState.startZoom * factor));
-    this.camera.panX = mid.x - before.x * GRID * this.camera.zoom;
-    this.camera.panY = mid.y - before.y * GRID * this.camera.zoom;
-  }
-
-  _onTouchEnd(e) {
-    if (e.touches.length < 2) this._touchState = null;
   }
 
   _onDblClick(e) {

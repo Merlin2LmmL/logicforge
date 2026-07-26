@@ -323,7 +323,13 @@ registerComponentType({
     const dataWidth = params.dataWidth ?? 8;
     let mem = state.mem;
     let fill = state.fill;
-    if (state.cachedPreset !== params.preset) mem = parseRomProgram(params.preset);
+    // Verteidigung gegen alte Speicherstände (Autosave/.lgf), die VOR dem Map-sicheren
+    // Serialisierungs-Fix (model.js/fileformat.js/library.js) angelegt wurden: dort wurde
+    // die Map beim Speichern/Laden lautlos zu einem normalen Objekt `{}`, was hier zum
+    // Absturz führte ("mem.has is not a function"). Statt zu crashen, wird in dem Fall
+    // das Programm einfach neu aus dem Preset geparst.
+    if (!(mem instanceof Map)) mem = parseRomProgram(params.preset);
+    else if (state.cachedPreset !== params.preset) mem = parseRomProgram(params.preset);
     if (state.cachedFill !== params.fill) fill = parseInt(params.fill ?? '0', 16) || 0;
     const addrBits = inputs.addr || new Array(addrWidth).fill(FLOATING);
     const addr = toInt(addrBits) ?? 0;
