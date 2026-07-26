@@ -49,6 +49,12 @@ registerComponentType({
   category: 'Ein-/Ausgabe',
   label: 'Clock',
   color: '#e0e6ec',
+  // Marks this as a component whose OUTPUT can change over time on its own (i.e. without
+  // any input/state change triggering it), which the editor's main loop (src/ui/editor.js,
+  // `circuitHasActiveClock`) uses to decide whether a frame needs fine time-sliced
+  // sub-stepping at all. Only relevant when hz > 0 - at hz === 0 a Clock is just a manual
+  // toggle like a Switch and never changes on its own between clicks.
+  isClock: true,
   paramsSchema: [
     { key: 'hz', label: 'Frequenz (Hz), 0 = manuell', kind: 'int', min: 0, max: 1_000_000, step: 1, default: 1 },
     { key: 'pulseMs', label: 'Impulsdauer (ms), 0 = 50% Tastgrad', kind: 'int', min: 0, max: 1_000_000, step: 1, default: 0 },

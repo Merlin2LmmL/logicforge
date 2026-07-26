@@ -3,7 +3,7 @@ import { getComponentType, categorized, defaultParams } from '../core/registry.j
 import { settleCircuit, resetCircuitState } from '../core/simulator.js';
 import {
   listDefinitions, createCompositeDefinition, createCodeDefinition,
-  removeDefinition, persist,
+  removeDefinition, persist, getDefinition,
 } from '../core/library.js';
 import {
   serializeCircuit, deserializeCircuit, serializeComponent,
@@ -31,6 +31,33 @@ const a = inputs.A ? inputs.A[0] : 0;
 const b = inputs.B ? inputs.B[0] : 0;
 return { outputs: { Y: [(a && b) ? 1 : 0] }, state };
 `;
+
+// Does this circuit contain any component whose output can change purely with the passage
+// of time (currently: a CLOCK with hz > 0), recursing into composite components' nested
+// sub-circuits? Used by Editor._frame to decide whether a frame needs fine time-sliced
+// sub-stepping at all, or whether a single settle at real-time resolution is enough.
+// Code components are deliberately not recursed into or treated as clock-like: their
+// evaluate() never receives `now` (see core/library.js buildCodeType), so nothing in a
+// code component's own behavior can depend on wall-clock/sim time.
+function circuitHasActiveClock(components, seenTypes = new Set()) {
+  for (const inst of components) {
+    const def = getComponentType(inst.type);
+    if (!def) continue;
+    if (def.isClock) {
+      if ((inst.params?.hz ?? 0) > 0) return true;
+      continue;
+    }
+    if (def.isComposite) {
+      if (seenTypes.has(inst.type)) continue; // guard against pathological self-referential defs
+      seenTypes.add(inst.type);
+      const libDef = getDefinition(inst.type);
+      if (libDef?.kind === 'composite' && libDef.circuit?.components?.length) {
+        if (circuitHasActiveClock(libDef.circuit.components, seenTypes)) return true;
+      }
+    }
+  }
+  return false;
+}
 
 export class Editor {
   constructor(dom) {
@@ -186,15 +213,47 @@ export class Editor {
     const realDeltaMs = this._lastFrameNow != null ? Math.min(now - this._lastFrameNow, 250) : 16;
     this._lastFrameNow = now;
 
-    const simDeltaMs = realDeltaMs * this.simSpeed;
-    const stepMs = Math.max(this.simStepMs, simDeltaMs / this.maxSubStepsPerFrame);
-    let remaining = simDeltaMs;
-    let wireValues = this.wireValues, instanceOutputs = this.instanceOutputs;
+    let wireValues, instanceOutputs;
 
-    while (remaining > 0) {
-      this.simTime += stepMs;
-      remaining -= stepMs;
+    if (!circuitHasActiveClock(this.circuit.components)) {
+      // Keine aktive (hz>0) Clock irgendwo in der Schaltung, weder direkt platziert noch
+      // in einer verschachtelten Komponente -> nichts hier hängt von feiner zeitlicher
+      // Auflösung ab, ein einziger settleCircuit()-Aufruf pro Frame reicht vollkommen.
+      //
+      // Vorher wurde HIER BEDINGUNGSLOS IMMER mit der vollen 1000x-Zeitraffer-Maschinerie
+      // simuliert (bis zu maxSubStepsPerFrame=20000 Sub-Schritte, jeder davon ein
+      // vollständiger settleCircuit()-Durchlauf mit bis zu 48 internen Iterationen) - rein
+      // vorsorglich, für den Fall, dass irgendwo ein hochfrequenter Takt stecken könnte.
+      // Selbst eine Schaltung aus nur einem Schalter und einem Gatter (kein Takt weit und
+      // breit) wurde dadurch JEDEN Frame bis zu ~20000 * 48 ≈ 960.000-mal ausgewertet - das
+      // war die Hauptursache für das massive Ruckeln auch bei einfachen Schaltungen.
+      this.simTime += realDeltaMs;
       ({ wireValues, instanceOutputs } = settleCircuit(this.circuit, { now: this.simTime }));
+    } else {
+      // Es gibt (mindestens) einen echten, laufenden Taktgeber - dessen Impulse dürfen
+      // nicht "verschluckt" werden, auch wenn er viel schneller tickt als der Bildschirm
+      // Frames liefert. Dafür weiterhin feine Sub-Schritte in virtueller Zeit.
+      const simDeltaMs = realDeltaMs * this.simSpeed;
+      const stepMs = Math.max(this.simStepMs, simDeltaMs / this.maxSubStepsPerFrame);
+      let remaining = simDeltaMs;
+      wireValues = this.wireValues;
+      instanceOutputs = this.instanceOutputs;
+
+      // Zeitbudget als Sicherheitsnetz: auch mit einem echten (u.U. sehr hochfrequenten)
+      // Takt darf ein einzelner Frame nicht beliebig lange rechnen, sonst friert bei einer
+      // großen Schaltung + hoher Taktfrequenz trotzdem die UI ein. Wird das Budget
+      // aufgebraucht, bricht die Schleife ab; die virtuelle Simulationszeit bleibt für
+      // diesen Frame dann etwas hinter der (skalierten) Wanduhr zurück, statt dass das UI
+      // blockiert - der nächste Frame setzt einfach dort fort, wo dieser aufgehört hat.
+      const budgetDeadline = performance.now() + 8;
+      let iters = 0;
+      while (remaining > 0) {
+        this.simTime += stepMs;
+        remaining -= stepMs;
+        ({ wireValues, instanceOutputs } = settleCircuit(this.circuit, { now: this.simTime }));
+        iters++;
+        if ((iters & 63) === 0 && performance.now() > budgetDeadline) break;
+      }
     }
 
     this.wireValues = wireValues;
