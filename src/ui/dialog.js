@@ -115,3 +115,43 @@ export function toast(msg, kind = 'info') {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+
+const SHORTCUTS = [
+  ['Strg+Z', 'Rückgängig'],
+  ['Strg+Y / Strg+Shift+Z', 'Wiederholen'],
+  ['Strg+S', 'Speichern'],
+  ['Strg+O', 'Öffnen'],
+  ['Strg+A', 'Alles auswählen'],
+  ['Strg+C / Strg+V', 'Kopieren / Einfügen'],
+  ['R', 'Drehen'],
+  ['Entf', 'Löschen'],
+  ['O', 'Ortho-Modus umschalten'],
+  ['Leertaste + Ziehen', 'Schwenken'],
+  ['Mausrad', 'Zoomen'],
+  ['Esc', 'Abbrechen'],
+];
+
+export function showShortcuts() {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'lf-modal-overlay';
+    const box = document.createElement('div');
+    box.className = 'lf-modal lf-shortcuts-modal';
+    box.innerHTML = `
+      <h3>Tastenkürzel</h3>
+      <dl class="lf-shortcuts">
+        ${SHORTCUTS.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('')}
+      </dl>
+      <p class="lf-modal-msg">Ortho-Modus: Neue Kabel laufen nur waagrecht/senkrecht. Bei aktivem Ortho-Modus lassen sich einzelne Segmente per Klick+Ziehen verschieben.</p>
+      <div class="lf-modal-actions">
+        <button class="lf-btn lf-btn-primary" id="lf-shortcuts-close">Schließen</button>
+      </div>
+      <div class="lf-credit">LogicForge &middot; Merlin Ortner &middot; <a href="mailto:ortnermerlin@gmail.com">ortnermerlin@gmail.com</a></div>
+    `;
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    const close = () => { overlay.remove(); resolve(); };
+    box.querySelector('#lf-shortcuts-close').onclick = close;
+    overlay.onclick = (e) => { if (e.target === overlay) close(); };
+  });
+}

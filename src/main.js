@@ -8,7 +8,7 @@ import { Editor, CATEGORY_ORDER, categorized, listDefinitions } from './ui/edito
 import { getComponentType } from './core/registry.js';
 import { loadFromStorage } from './core/library.js';
 import { deserializeCircuit } from './core/fileformat.js';
-import { showDialog } from './ui/dialog.js';
+import { showDialog, showShortcuts } from './ui/dialog.js';
 
 const AUTOSAVE_KEY = 'logicforge:autosave:v1';
 
@@ -69,28 +69,6 @@ bind('canvas-help', () => showShortcuts());
 function bind(id, fn) {
   const el = document.getElementById(id);
   if (el) el.onclick = fn;
-}
-
-function showShortcuts() {
-  showDialog({
-    title: 'Tastenkürzel',
-    submitLabel: 'Schließen',
-    cancelLabel: '',
-    fields: [
-      {
-        key: 'info',
-        label:
-          'Strg+Z Rückgängig · Strg+Y/Shift+Strg+Z Wiederholen · Strg+S Speichern · ' +
-          'Strg+O Öffnen · Strg+A Alles wählen · Strg+C/V Kopieren/Einfügen · ' +
-          'R Drehen · Entf Löschen · O Ortho-Modus · ' +
-          'Leertaste+Ziehen Schwenken · Mausrad Zoom · Esc Abbrechen\n\n' +
-          'Ortho-Modus: Neue Kabel laufen nur waagrecht/senkrecht (L-Form). ' +
-          'Einzelne Kabelsegmente können durch Klicken und Ziehen verschoben werden.',
-        type: 'textarea',
-        rows: 6,
-      },
-    ],
-  });
 }
 
 // ---------------------------------------------------------------- Palette

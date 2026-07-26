@@ -82,3 +82,22 @@ export function wirePath(circuit, wire) {
   if (!start || !end) return null;
   return [start, ...wire.points, end];
 }
+
+// Entfernt aufeinanderfolgende doppelte Punkte und Zwischenpunkte, die exakt auf
+// der Linie zwischen ihren Nachbarn liegen (kein echter Knick mehr vorhanden).
+export function simplifyPoints(points) {
+  const pts = points.filter((p, i) => i === 0 || Math.hypot(p.x - points[i - 1].x, p.y - points[i - 1].y) > 0.001);
+  const out = [];
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    if (i > 0 && i < pts.length - 1) {
+      const a = pts[i - 1], b = pts[i + 1];
+      const collinear =
+        (Math.abs(a.x - p.x) < 0.001 && Math.abs(p.x - b.x) < 0.001) ||
+        (Math.abs(a.y - p.y) < 0.001 && Math.abs(p.y - b.y) < 0.001);
+      if (collinear) continue;
+    }
+    out.push(p);
+  }
+  return out;
+}

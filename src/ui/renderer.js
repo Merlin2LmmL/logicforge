@@ -1,5 +1,6 @@
 import { GRID, computeLayout, effectiveSize, wirePath, getDef, pointToSegDist } from './layout.js';
 import { FLOATING, CONFLICT, toInt } from '../core/bits.js';
+import { sliderTrackRect, formatSliderValue } from '../components/io.js';
 
 export const COLORS = {
   bg: '#0a0e14',
@@ -112,17 +113,28 @@ export function render(ctx, w, h, S) {
 }
 
 function drawGrid(ctx, camera, w, h) {
-  const step = GRID * camera.zoom;
-  if (step < 4) return;
-  const ox = camera.panX % step;
-  const oy = camera.panY % step;
-  ctx.fillStyle = COLORS.gridDot;
   const majorEvery = 5;
+  let cellStep = 1; // wie viele Gitterzellen zwischen gezeichneten Punkten liegen
+  let step = GRID * camera.zoom;
+
+  // Bei zu geringem Pixelabstand nicht abbrechen, sondern gröber rastern:
+  // erst auf Major-Punkte (alle 5 Zellen), bei Bedarf noch weiter ausdünnen.
+  while (step < 4 && cellStep < 1000) {
+    cellStep *= majorEvery;
+    step = GRID * camera.zoom * cellStep;
+  }
+  if (step < 2) return; // absolute Untergrenze, sonst reine Pixelsuppe
+
+  ctx.fillStyle = COLORS.gridDot;
   const startCol = Math.floor(-camera.panX / step);
   const startRow = Math.floor(-camera.panY / step);
+  const ox = (-camera.panX) - startCol * step;
+  const oy = (-camera.panY) - startRow * step;
+
   for (let x = ox, col = startCol; x < w; x += step, col++) {
     for (let y = oy, row = startRow; y < h; y += step, row++) {
-      const major = col % majorEvery === 0 && row % majorEvery === 0;
+      // "major" nur sinnvoll, wenn wir noch auf Zellebene (cellStep===1) zeichnen
+      const major = cellStep === 1 && col % majorEvery === 0 && row % majorEvery === 0;
       ctx.fillStyle = major ? COLORS.gridDotMajor : COLORS.gridDot;
       const r = major ? 1.6 : 1;
       ctx.beginPath();
@@ -162,9 +174,28 @@ function drawWire(ctx, camera, points, state, selected, time, lineWidth, invalid
 
 // ---- junction dots ----
 
+// Prüft, ob zwei achsparallele, kollineare Segmente sich überlappen (nicht nur
+// berühren). Gibt bei Überlappung Achse + Bereich zurück, sonst null.
+function segmentsOverlap(a1, a2, b1, b2) {
+  const aH = Math.abs(a1.y - a2.y) < 0.01, aV = Math.abs(a1.x - a2.x) < 0.01;
+  const bH = Math.abs(b1.y - b2.y) < 0.01, bV = Math.abs(b1.x - b2.x) < 0.01;
+  if (aH && bH && Math.abs(a1.y - b1.y) < 0.01) {
+    const lo = Math.max(Math.min(a1.x, a2.x), Math.min(b1.x, b2.x));
+    const hi = Math.min(Math.max(a1.x, a2.x), Math.max(b1.x, b2.x));
+    if (hi - lo > 0.01) return { axis: 'x', y: a1.y, lo, hi };
+  }
+  if (aV && bV && Math.abs(a1.x - b1.x) < 0.01) {
+    const lo = Math.max(Math.min(a1.y, a2.y), Math.min(b1.y, b2.y));
+    const hi = Math.min(Math.max(a1.y, a2.y), Math.max(b1.y, b2.y));
+    if (hi - lo > 0.01) return { axis: 'y', x: a1.x, lo, hi };
+  }
+  return null;
+}
+
 function computeJunctions(circuit, wires, wirePaths, wireValues) {
   // Fan-out: source pins with ≥2 wires leaving them get a dot
   const fromCount = new Map();
+  const netGroups = new Map(); // gleicher Quellpin = gleiches Netz
   for (const wire of wires) {
     const key = `${wire.from.compId}|${wire.from.pinId}`;
     if (!fromCount.has(key)) {
@@ -172,6 +203,8 @@ function computeJunctions(circuit, wires, wirePaths, wireValues) {
       fromCount.set(key, { pos: path ? path[0] : null, count: 0, wireId: wire.id });
     }
     fromCount.get(key).count++;
+    if (!netGroups.has(key)) netGroups.set(key, []);
+    netGroups.get(key).push(wire.id);
   }
   const junctions = [];
   for (const { pos, count, wireId } of fromCount.values()) {
@@ -192,7 +225,6 @@ function computeJunctions(circuit, wires, wirePaths, wireValues) {
       if (!pathB) continue;
       for (let k = 0; k < pathB.length - 1; k++) {
         const a = pathB[k], b = pathB[k + 1];
-        // Skip if endPt is at one of the segment's own endpoints
         if (Math.hypot(endPt.x - a.x, endPt.y - a.y) < 0.05) continue;
         if (Math.hypot(endPt.x - b.x, endPt.y - b.y) < 0.05) continue;
         if (pointToSegDist(endPt.x, endPt.y, a.x, a.y, b.x, b.y) < 0.05) {
@@ -204,7 +236,42 @@ function computeJunctions(circuit, wires, wirePaths, wireValues) {
     }
   }
 
-  return junctions;
+  // Überlappende Segmente innerhalb desselben Netzes (gleicher Quellpin) ->
+  // an den Rändern der Überlappung ebenfalls einen Verbindungspunkt setzen,
+  // damit die Kabel optisch zu einer Leitung verschmelzen.
+  for (const wireIds of netGroups.values()) {
+    if (wireIds.length < 2) continue;
+    for (let a = 0; a < wireIds.length; a++) {
+      const pathA = wirePaths.get(wireIds[a]);
+      if (!pathA) continue;
+      for (let b = a + 1; b < wireIds.length; b++) {
+        const pathB = wirePaths.get(wireIds[b]);
+        if (!pathB) continue;
+        for (let i = 0; i < pathA.length - 1; i++) {
+          for (let j = 0; j < pathB.length - 1; j++) {
+            const ov = segmentsOverlap(pathA[i], pathA[i + 1], pathB[j], pathB[j + 1]);
+            if (!ov) continue;
+            const bits = wireValues?.get(wireIds[a]);
+            const p1 = ov.axis === 'x' ? { x: ov.lo, y: ov.y } : { x: ov.x, y: ov.lo };
+            const p2 = ov.axis === 'x' ? { x: ov.hi, y: ov.y } : { x: ov.x, y: ov.hi };
+            junctions.push({ pos: p1, bits });
+            junctions.push({ pos: p2, bits });
+          }
+        }
+      }
+    }
+  }
+
+  // Duplikate an (fast) derselben Stelle entfernen
+  const seen = new Set();
+  const deduped = [];
+  for (const j of junctions) {
+    const key = `${j.pos.x.toFixed(2)}|${j.pos.y.toFixed(2)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(j);
+  }
+  return deduped;
 }
 
 function drawJunctionDot(ctx, camera, { pos, bits }) {
@@ -251,6 +318,12 @@ function drawComponent(ctx, camera, inst, opts) {
     const sp = worldToScreen(camera, world.x, world.y);
     const bits = pin.dir === 'out' ? opts.outputs?.[pin.id] : wireValueInto(opts.circuit, opts.wireValues, inst.id, pin.id);
     drawPin(ctx, sp, bits, opts.hover, camera.zoom);
+    if (camera.zoom > 0.55) {
+      const connected = pin.dir === 'out'
+        ? opts.circuit.wiresFrom(inst.id, pin.id).length > 0
+        : !!opts.circuit.wireInto(inst.id, pin.id);
+      drawPinLabel(ctx, sp, pin, pos.side, camera.zoom, connected);
+    }
   }
 
   // selection outline (axis-aligned effective bbox, easier to read than rotated one)
@@ -335,6 +408,36 @@ function drawPinTooltip(ctx, camera, hover) {
   ctx.restore();
 }
 
+function drawPinLabel(ctx, sp, pin, side, zoom, connected) {
+  const text = pin.label || pin.id;
+  if (!text) return;
+  ctx.save();
+  const fontSize = 9 * Math.min(1.3, zoom);
+  ctx.font = `${fontSize}px "JetBrains Mono", monospace`;
+  ctx.fillStyle = COLORS.textDim;
+  const offset = 6 * zoom;      // Abstand vom Pin entlang der Kabelachse
+  const clear = connected ? 5 * zoom : 0; // Versatz quer zum Kabel nur bei belegtem Pin
+
+  if (side === 'left') {
+    ctx.textAlign = 'right';
+    ctx.textBaseline = connected ? 'bottom' : 'middle';
+    ctx.fillText(text, sp.x - offset, sp.y - clear);
+  } else if (side === 'right') {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = connected ? 'bottom' : 'middle';
+    ctx.fillText(text, sp.x + offset, sp.y - clear);
+  } else if (side === 'top') {
+    ctx.textAlign = connected ? 'left' : 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(text, sp.x + clear, sp.y - offset);
+  } else {
+    ctx.textAlign = connected ? 'left' : 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText(text, sp.x + clear, sp.y + offset);
+  }
+  ctx.restore();
+}
+
 // ---- component body drawing (local coords: origin at center, x right, y down) ----
 
 function boxRect(ctx, pw, ph, fill, stroke, hover) {
@@ -390,8 +493,8 @@ function gateOrShape(ctx, pw, ph, color, bubble, xor) {
   const y0 = -ph / 2, y1 = ph / 2;
   ctx.beginPath();
   ctx.moveTo(x0, y0);
-  ctx.quadraticCurveTo(x0 + pw * 0.55, y0, x1, 0);   // obere Kante: nach außen wölben
-  ctx.quadraticCurveTo(x0 + pw * 0.55, y1, x0, y1);  // untere Kante: nach außen wölben
+  ctx.quadraticCurveTo(x0 + pw * 0.8, y0, x1, 0);   // obere Kante: nach außen wölben
+  ctx.quadraticCurveTo(x0 + pw * 0.8, y1, x0, y1);  // untere Kante: nach außen wölben
   ctx.quadraticCurveTo(x0 + pw * 0.18, 0, x0, y0);   // Rückseite: konkav (bleibt wie gehabt)
   ctx.closePath();
   ctx.fillStyle = COLORS.compFill;
@@ -440,13 +543,22 @@ function drawBody(ctx, def, inst, pw, ph, opts) {
   if (type === 'SWITCH') return drawSwitch(ctx, pw, ph, inst, opts);
   if (type === 'BUTTON') return drawButton(ctx, pw, ph, inst, opts);
   if (type === 'CLOCK') return drawClock(ctx, pw, ph, inst, opts);
-  if (type === 'CONST0' || type === 'CONST1') return drawConst(ctx, pw, ph, type === 'CONST1', def.color);
+  if (type === 'PULLUP') return drawPullUpArrow(ctx, pw, ph, def.color);
+  if (type === 'PULLDOWN') return drawPullDownArrow(ctx, pw, ph, def.color);
   if (type === 'LAMP') return drawLamp(ctx, pw, ph, inst, opts);
   if (type === 'DISPLAY') return drawDisplay(ctx, pw, ph, inst, opts, def);
   if (type === 'PROBE') return drawProbe(ctx, pw, ph, inst, opts);
   if (type === 'PIN_IN' || type === 'PIN_OUT') return drawInterfacePin(ctx, pw, ph, inst, opts, type);
   if (type === 'TUNNEL_IN' || type === 'TUNNEL_OUT') return drawTunnel(ctx, pw, ph, inst, type);
   if (type === 'SPLITTER' || type === 'MERGER') return drawSplitMerge(ctx, pw, ph, inst, type);
+  if (type === 'ADDSUB') return drawAddSub(ctx, pw, ph, inst, opts, def);
+  if (type === 'MUX') return drawMuxDemux(ctx, pw, ph, inst, opts, def, true);
+  if (type === 'DEMUX') return drawMuxDemux(ctx, pw, ph, inst, opts, def, false);
+  if (type === 'SEVENSEG') return drawSevenSeg(ctx, pw, ph, inst, opts);
+  if (type === 'TRISTATE') return drawTriState(ctx, pw, ph, def, opts);
+  if (type === 'RGBLED') return drawRgbLed(ctx, pw, ph, inst, opts);
+  if (type === 'BUSWATCH') return drawBusWatch(ctx, pw, ph, inst, opts, def);
+  if (type === 'SLIDER') return drawSliderTrack(ctx, pw, ph, inst, opts);
 
   // generic box (registers, RAM, DFF, custom composite/code components...)
   boxRect(ctx, pw, ph, COLORS.compFill, opts.selected ? COLORS.compBorderSelected : def.color || COLORS.compBorder, opts.hover);
@@ -497,14 +609,47 @@ function drawClock(ctx, pw, ph, inst, opts) {
   ctx.stroke();
 }
 
-function drawConst(ctx, pw, ph, high, color) {
+function drawPullUpArrow(ctx, pw, ph, color) {
+  const headLen = Math.min(8, ph * 0.35);
+  const shaftTop = -ph / 2 + headLen;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 1.8;
   ctx.beginPath();
-  ctx.moveTo(-pw / 2, 0);
-  ctx.lineTo(pw / 2, 0);
-  ctx.strokeStyle = high ? COLORS.pinHigh : COLORS.textDim;
-  ctx.lineWidth = 2;
+  ctx.moveTo(0, ph / 2);
+  ctx.lineTo(0, shaftTop);
   ctx.stroke();
-  label(ctx, high ? '1' : '0', high ? COLORS.pinHigh : COLORS.textDim, 12);
+  ctx.beginPath();
+  ctx.moveTo(0, -ph / 2);
+  ctx.lineTo(-4, shaftTop);
+  ctx.lineTo(4, shaftTop);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPullDownArrow(ctx, pw, ph, color) {
+  // Klassisches Pull-down-Symbol: Schaft + größerer, hohler Dreieckskopf unten
+  const headLen = Math.min(12, ph * 0.5);
+  const headW = Math.min(11, pw * 0.42);
+  const shaftBottom = ph / 2 - headLen;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.8;
+  ctx.beginPath();
+  ctx.moveTo(0, -ph / 2);
+  ctx.lineTo(0, shaftBottom);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(0, ph / 2);
+  ctx.lineTo(-headW, shaftBottom);
+  ctx.lineTo(headW, shaftBottom);
+  ctx.closePath();
+  ctx.fillStyle = COLORS.compFill; // hohl: mit Hintergrundfarbe statt Randfarbe füllen
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
 }
 
 function drawLamp(ctx, pw, ph, inst, opts) {
@@ -585,4 +730,166 @@ function drawSplitMerge(ctx, pw, ph, inst) {
     ctx.lineTo(pw / 2 - 4, 0);
     ctx.stroke();
   }
+}
+
+function drawAddSub(ctx, pw, ph, inst, opts, def) {
+  boxRect(ctx, pw, ph, COLORS.compFill, opts.selected ? COLORS.compBorderSelected : def.color, opts.hover);
+  ctx.save();
+  ctx.fillStyle = def.color;
+  ctx.font = `bold ${Math.min(18, ph * 0.4)}px "JetBrains Mono", monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Σ', 0, -ph * 0.08);
+  ctx.font = `${Math.min(10, ph * 0.18)}px "JetBrains Mono", monospace`;
+  ctx.fillStyle = COLORS.textDim;
+  ctx.fillText('±', 0, ph / 2 - 9);
+  ctx.restore();
+}
+
+function drawMuxDemux(ctx, pw, ph, inst, opts, def, isMux) {
+  const halfW = pw / 2, halfH = ph / 2;
+  // Mux: breite Seite (viele Eingänge) links, schmale Seite (ein Ausgang) rechts. Demux umgekehrt.
+  const leftH = isMux ? halfH : halfH * 0.6;
+  const rightH = isMux ? halfH * 0.6 : halfH;
+  ctx.beginPath();
+  ctx.moveTo(-halfW, -leftH);
+  ctx.lineTo(halfW, -rightH);
+  ctx.lineTo(halfW, rightH);
+  ctx.lineTo(-halfW, leftH);
+  ctx.closePath();
+  ctx.fillStyle = COLORS.compFill;
+  ctx.fill();
+  ctx.strokeStyle = opts.selected ? COLORS.compBorderSelected : def.color;
+  ctx.lineWidth = 1.6;
+  ctx.stroke();
+  ctx.save();
+  ctx.fillStyle = def.color;
+  ctx.font = `bold ${Math.min(12, ph * 0.22)}px "JetBrains Mono", monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(isMux ? 'MUX' : 'DMX', 0, 0);
+  ctx.restore();
+}
+
+function drawSevenSeg(ctx, pw, ph, inst, opts) {
+  boxRect(ctx, pw, ph, '#0d1712', opts.selected ? COLORS.compBorderSelected : '#274a2e', opts.hover);
+  const segs = inst.state?.segs || {};
+  const dw = pw * 0.42, dh = ph * 0.62;
+  const left = -dw / 2, right = dw / 2, top = -dh / 2, mid = 0, bottom = dh / 2;
+  const lines = {
+    a: [[left, top], [right, top]],
+    b: [[right, top], [right, mid]],
+    c: [[right, mid], [right, bottom]],
+    d: [[left, bottom], [right, bottom]],
+    e: [[left, mid], [left, bottom]],
+    f: [[left, top], [left, mid]],
+    g: [[left, mid], [right, mid]],
+  };
+  ctx.save();
+  ctx.lineCap = 'round';
+  for (const [id, [[x0, y0], [x1, y1]]] of Object.entries(lines)) {
+    const on = !!segs[id];
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.strokeStyle = on ? '#7cff9e' : '#1c2e22';
+    ctx.lineWidth = Math.max(2, ph * 0.09);
+    ctx.shadowColor = on ? '#7cff9e' : 'transparent';
+    ctx.shadowBlur = on ? 5 : 0;
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+  ctx.beginPath();
+  ctx.arc(right + 5, bottom, 2.4, 0, Math.PI * 2);
+  ctx.fillStyle = segs.dp ? '#7cff9e' : '#1c2e22';
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawTriState(ctx, pw, ph, def, opts) {
+  gateTriShape(ctx, pw, ph, opts.selected ? COLORS.compBorderSelected : def.color, false);
+  // kleiner Stummel deutet den Enable-Eingang von unten an (Standard-Tristate-Symbol)
+  ctx.save();
+  ctx.strokeStyle = def.color;
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.moveTo(0, ph / 2 - 3);
+  ctx.lineTo(0, ph / 2 + 5);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawRgbLed(ctx, pw, ph, inst, opts) {
+  const { r = 0, g = 0, b = 0 } = inst.state || {};
+  const col = `rgb(${r}, ${g}, ${b})`;
+  const rad = Math.min(pw, ph) * 0.34;
+  const bright = (r + g + b) > 0;
+  if (bright) {
+    const grad = ctx.createRadialGradient(0, 0, rad * 0.2, 0, 0, rad * 2);
+    grad.addColorStop(0, col.replace('rgb', 'rgba').replace(')', ',0.55)'));
+    grad.addColorStop(1, col.replace('rgb', 'rgba').replace(')', ',0)'));
+    ctx.fillStyle = grad;
+    ctx.fillRect(-rad * 2.2, -rad * 2.2, rad * 4.4, rad * 4.4);
+  }
+  ctx.beginPath();
+  ctx.arc(0, 0, rad, 0, Math.PI * 2);
+  ctx.fillStyle = col;
+  ctx.fill();
+  ctx.strokeStyle = opts.selected ? COLORS.compBorderSelected : COLORS.compBorder;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
+function drawBusWatch(ctx, pw, ph, inst, opts, def) {
+  boxRect(ctx, pw, ph, COLORS.compFill, opts.selected ? COLORS.compBorderSelected : def.color, opts.hover);
+  const bits = inst.state?.last;
+  const lines = bits
+    ? [`h ${def.formatValue(bits, 'hex')}`, `d ${def.formatValue(bits, 'dec')}`, `b ${def.formatValue(bits, 'bin')}`]
+    : ['h --', 'd --', 'b --'];
+  ctx.save();
+  ctx.fillStyle = COLORS.text;
+  ctx.font = `${Math.min(10, ph / 5)}px "JetBrains Mono", monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const lineH = ph / (lines.length + 1);
+  lines.forEach((l, i) => ctx.fillText(l, 0, -ph / 2 + lineH * (i + 1)));
+  ctx.restore();
+}
+
+function drawSliderTrack(ctx, pw, ph, inst, opts) {
+  boxRect(ctx, pw, ph, COLORS.compFill, opts.selected ? COLORS.compBorderSelected : COLORS.compBorder, opts.hover);
+
+  const params = inst.params || {};
+  const width = params.width ?? 8;
+  const min = params.min ?? 0;
+  const max = params.max ?? (2 ** width - 1);
+  const lo = Math.min(min, max), hi = Math.max(min, max);
+  const value = inst.state?.value ?? lo;
+  const t = hi > lo ? (value - lo) / (hi - lo) : 0;
+
+  const trackMargin = pw * 0.12;
+  const x0 = -pw / 2 + trackMargin, x1 = pw / 2 - trackMargin;
+  const trackY = ph * 0.12; // leicht unter der Mitte, Platz für den Wert oben
+
+  ctx.save();
+  ctx.strokeStyle = COLORS.textDim;
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x0, trackY);
+  ctx.lineTo(x1, trackY);
+  ctx.stroke();
+
+  const hx = x0 + (x1 - x0) * t;
+  ctx.beginPath();
+  ctx.arc(hx, trackY, 5, 0, Math.PI * 2);
+  ctx.fillStyle = COLORS.compBorderSelected;
+  ctx.fill();
+
+  ctx.fillStyle = COLORS.text;
+  ctx.font = 'bold 11px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(formatSliderValue(value, params.format ?? 'dec'), 0, -ph * 0.2);
+  ctx.restore();
 }

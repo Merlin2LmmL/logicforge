@@ -350,6 +350,14 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; colo
 .lf-btn-ghost { color: var(--text-dim); }
 .lf-btn-danger { border-color: var(--red); color: var(--red); }
 
+.lf-shortcuts-modal { width: 420px; }
+.lf-shortcuts { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 4px 0 14px; }
+.lf-shortcuts dt { color: var(--teal); font-size: 12px; white-space: nowrap; }
+.lf-shortcuts dd { margin: 0; color: var(--text); font-size: 12px; }
+.lf-credit { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border-soft); color: var(--text-faint); font-size: 11px; text-align: center; }
+.lf-credit a { color: var(--teal); text-decoration: none; }
+.lf-credit a:hover { text-decoration: underline; }
+
 /* ---------- toasts ---------- */
 
 #lf-toasts {

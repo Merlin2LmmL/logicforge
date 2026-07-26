@@ -55,7 +55,9 @@ function buildCompositeType(def) {
     init: () => ({}),
     evaluate: ({ inputs, state, now }) => {
       let sub = state.sub;
-      if (!sub) sub = Circuit.fromPlain(def.circuit);
+      if (!sub || !(sub instanceof Circuit)) {
+        sub = Circuit.fromPlain(sub && sub.components ? sub : def.circuit);
+      }
       const forcedInputs = {};
       for (const p of def.pins) {
         if (p.dir === 'in') forcedInputs[p.id] = inputs[p.id] || makeFloating(p.width);

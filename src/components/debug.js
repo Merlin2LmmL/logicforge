@@ -59,3 +59,41 @@ registerComponentType({
     return { outputs: {}, state: { last: inputs.in0 || new Array(width).fill(FLOATING) } };
   },
 });
+
+registerComponentType({
+  type: 'SEVENSEG',
+  category: 'Debug',
+  label: '7-Segment',
+  color: '#7cff9e',
+  paramsSchema: [],
+  pins: () => ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'dp'].map((id, i) => ({
+    id, label: id.toUpperCase(), dir: 'in', width: 1, side: 'left', order: i,
+  })),
+  size: () => ({ w: 3, h: 5 }),
+  init: () => ({}),
+  evaluate: ({ inputs }) => {
+    const segs = {};
+    for (const id of ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'dp']) segs[id] = inputs[id]?.[0] === 1 ? 1 : 0;
+    return { outputs: {}, state: { segs } };
+  },
+});
+
+registerComponentType({
+  type: 'BUSWATCH',
+  category: 'Debug',
+  label: 'Bus-Watch',
+  color: '#e0e6ec',
+  paramsSchema: [{ key: 'width', label: 'Bitbreite', kind: 'int', min: 1, max: 32, step: 1, default: 8 }],
+  pins: (params) => [{ id: 'in0', label: '', dir: 'in', width: params.width ?? 8, side: 'left', order: 0 }],
+  size: () => ({ w: 5, h: 3 }),
+  init: () => ({}),
+  evaluate: ({ inputs, params }) => {
+    const width = params.width ?? 8;
+    return { outputs: {}, state: { last: inputs.in0 || new Array(width).fill(FLOATING) } };
+  },
+  formatValue(bits, mode) {
+    if (mode === 'bin') return bitsToBinaryString(bits);
+    if (mode === 'dec') return bitsToDecString(bits);
+    return bitsToHexString(bits);
+  },
+});

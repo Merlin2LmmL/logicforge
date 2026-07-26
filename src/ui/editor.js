@@ -9,16 +9,19 @@ import {
   serializeCircuit, deserializeCircuit, serializeComponent,
   importComponentFile, downloadTextFile, pickTextFile,
 } from '../core/fileformat.js';
-import { GRID, computeLayout, instanceBounds, pointInInstance, pointToSegDist, wirePath, pinWorldPos } from './layout.js';
+import { GRID, computeLayout, instanceBounds, pointInInstance, pointToSegDist, wirePath, pinWorldPos, simplifyPoints } from './layout.js';
 import { render, COLORS, worldToScreen, screenToWorld } from './renderer.js';
 import { showDialog, confirmDialog, toast } from './dialog.js';
 import { CATEGORY_ORDER } from '../components/index.js';
+import { sliderTrackRect } from '../components/io.js';
 
 const AUTOSAVE_KEY = 'logicforge:autosave:v1';
 const PIN_HIT_PX = 9;
 const WIRE_HIT_PX = 6;
 const MOVE_THRESHOLD_PX = 4;
 const HISTORY_LIMIT = 100;
+const MIN_ZOOM = 0.10;
+const MAX_ZOOM = 8;
 
 const DEFAULT_CODE_TEMPLATE = `// inputs.A / inputs.B sind Bit-Arrays (LSB zuerst): 0, 1, null (offen) oder 'X' (Konflikt)
 // state ist dein eigener, dauerhafter Zustand (Startwert: {})
@@ -52,7 +55,7 @@ export class Editor {
     this.history = [];
     this.historyIndex = -1;
 
-    this.drag = null; // { kind: 'move'|'pan', ... }
+    this.drag = null; // { kind: 'move'|'pan'|'wire-seg'|'marquee', ... }
     this.keys = { space: false };
     this.activeCategory = null;
     this.lastMouseWorld = { x: 0, y: 0 };
@@ -183,6 +186,25 @@ export class Editor {
 
   _snap(x, y) { return { x: Math.round(x), y: Math.round(y) }; }
 
+  // Rastet einen Weltpunkt fürs Kabelziehen ein: liegt er nah an einem der
+  // übergebenen Pins, wird dessen EXAKTE (ggf. nicht-ganzzahlige) Position
+  // übernommen. Sonst wird pro Achse einzeln entschieden: liegt die Achse nah
+  // an einem Pin, wird dessen exakter Wert für diese Achse genommen (kein
+  // Runden -> keine Schräglinie), sonst normal aufs Gitter gerundet.
+  _snapForWire(wx, wy, refPins = []) {
+    const pinTol = PIN_HIT_PX / (GRID * this.camera.zoom);
+    for (const p of refPins) {
+      if (p && Math.hypot(wx - p.x, wy - p.y) <= pinTol) return { x: p.x, y: p.y };
+    }
+    let sx = Math.round(wx), sy = Math.round(wy);
+    for (const p of refPins) {
+      if (!p) continue;
+      if (Math.abs(wx - p.x) <= pinTol) sx = p.x;
+      if (Math.abs(wy - p.y) <= pinTol) sy = p.y;
+    }
+    return { x: sx, y: sy };
+  }
+
   // ---------------------------------------------------------------- hit testing
 
   _findPinAt(wx, wy) {
@@ -235,7 +257,7 @@ export class Editor {
     window.addEventListener('pointermove', (e) => this._onPointerMove(e));
     window.addEventListener('pointerup', (e) => this._onPointerUp(e));
     c.addEventListener('wheel', (e) => this._onWheel(e), { passive: false });
-    c.addEventListener('contextmenu', (e) => e.preventDefault());
+    c.addEventListener('contextmenu', (e) => this._onContextMenu(e));
     c.addEventListener('dblclick', (e) => this._onDblClick(e));
 
     window.addEventListener('keydown', (e) => this._onKeyDown(e));
@@ -246,6 +268,15 @@ export class Editor {
   _screenPos(e) {
     const rect = this.canvas.getBoundingClientRect();
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  _onContextMenu(e) {
+    e.preventDefault();
+    // Rechtsklick während des Kabelziehens bricht den Entwurf ab (kein loses Kabel möglich).
+    if (this.wireDraft) {
+      this.wireDraft = null;
+      this.canvas.classList.remove('mode-wiring');
+    }
   }
 
   _onPointerDown(e) {
@@ -262,6 +293,13 @@ export class Editor {
     }
     if (e.button !== 0) return;
 
+    // aktiver Kabel-Entwurf: Klick entscheidet (Verbinden / Eckpunkt setzen / nichts) beim Loslassen,
+    // hier merken wir uns nur, wo diese Geste beginnt (fürs Unterscheiden Klick vs. Ziehen).
+    if (this.wireDraft) {
+      this.wireDraft.gestureDownScreen = sp;
+      return;
+    }
+
     // placing a new component from the palette
     if (this.placingType) {
       const def = getComponentType(this.placingType);
@@ -277,11 +315,13 @@ export class Editor {
       return;
     }
 
-    // pins first
+    // pins first: startet immer einen neuen Kabel-Entwurf, fest am Start-Pin verankert
     const pinHit = this._findPinAt(wp.x, wp.y);
     if (pinHit) {
       this.wireDraft = {
         startInst: pinHit.inst, startPin: pinHit.pin,
+        start: { x: pinHit.x, y: pinHit.y },
+        corners: [], // nur im Ortho-Modus relevant: manuell gesetzte Zwischenpunkte
         points: [{ x: pinHit.x, y: pinHit.y }, { x: wp.x, y: wp.y }],
         valid: true,
       };
@@ -303,6 +343,18 @@ export class Editor {
         this.refreshPanels();
       }
       // interactive components: BUTTON fires immediately (press semantics)
+      // Slider: Klick/Zug auf dem Track setzt den Wert, statt das Bauteil zu verschieben.
+      if (def?.onSliderInput) {
+        const track = sliderTrackRect(compHit);
+        const onTrack = Math.abs(wp.y - track.y) <= 0.5 && wp.x >= track.x0 - 0.3 && wp.x <= track.x1 + 0.3;
+        if (onTrack) {
+          const t = Math.max(0, Math.min(1, (wp.x - track.x0) / (track.x1 - track.x0)));
+          const prevValue = compHit.state?.value;
+          compHit.state = def.onSliderInput(compHit.state, compHit.params || {}, t);
+          this.drag = { kind: 'slider', inst: compHit, def, track, moved: false, prevValue };
+          return;
+        }
+      }
       if (def?.interactive && def.onPointerDown) {
         compHit.state = def.onPointerDown(compHit.state, compHit.params || {});
         this._buttonPressedId = compHit.id;
@@ -312,9 +364,24 @@ export class Editor {
         const inst = this.circuit.getComponent(id);
         if (inst) startPositions.set(id, { x: inst.x, y: inst.y });
       }
+      // Für jedes Kabel an einem bewegten Bauteil die Ausgangslage merken
+      // (Wegpunkte + exakte alte Pin-Positionen), um während des Ziehens
+      // absolut statt kumulativ neu rechnen zu können.
+      const wireSnapshots = new Map();
+      for (const wire of this.circuit.wires) {
+        if (!startPositions.has(wire.from.compId) && !startPositions.has(wire.to.compId)) continue;
+        const fromInst = this.circuit.getComponent(wire.from.compId);
+        const toInst = this.circuit.getComponent(wire.to.compId);
+        if (!fromInst || !toInst) continue;
+        wireSnapshots.set(wire.id, {
+          origPoints: wire.points.map((p) => ({ ...p })),
+          oldSrc: pinWorldPos(fromInst, wire.from.pinId),
+          oldTgt: pinWorldPos(toInst, wire.to.pinId),
+        });
+      }
       this.drag = {
         kind: 'move', startScreen: sp, startWorld: wp, moved: false,
-        startPositions, clickedInst: compHit, clickedDef: def,
+        startPositions, wireSnapshots, clickedInst: compHit, clickedDef: def,
       };
       return;
     }
@@ -327,13 +394,16 @@ export class Editor {
         this.refreshPanels();
       } else {
         if (!this.selection.has(wire.id)) { this.selection = new Set([wire.id]); this.refreshPanels(); }
-        // Start a potential segment drag; if user doesn't move enough it's just a click
-        this.drag = {
-          kind: 'wire-seg', wire, segIndex, segDir,
-          startScreen: sp, startWorld: wp, moved: false,
-          origPoints: wire.points.map((p) => ({ ...p })),
-        };
-        this.canvas.setPointerCapture(e.pointerId);
+        // Segmente einzeln verschieben gibt es nur im Ortho-Modus: nur dort existieren
+        // überhaupt Zwischenpunkte/Segmente, die unabhängig von den Pins bewegt werden können.
+        if (this.orthoMode) {
+          this.drag = {
+            kind: 'wire-seg', wire, segIndex, segDir,
+            startScreen: sp, startWorld: wp, moved: false,
+            origPoints: wire.points.map((p) => ({ ...p })),
+          };
+          this.canvas.setPointerCapture(e.pointerId);
+        }
       }
       return;
     }
@@ -361,9 +431,12 @@ export class Editor {
       }
       const start = this.wireDraft.points[0];
       if (this.orthoMode) {
-        const elbow = { x: endX, y: start.y };
-        this.wireDraft.points = [start, elbow, { x: endX, y: endY }];
+        const lastFixed = this.wireDraft.corners.length
+          ? this.wireDraft.corners[this.wireDraft.corners.length - 1]
+          : start;
+        this.wireDraft.points = [start, ...this.wireDraft.corners, { x: endX, y: lastFixed.y }, { x: endX, y: endY }];
       } else {
+        // Nicht-Ortho: immer reine Pin-zu-Pin-Linie, keine Zwischenpunkte
         this.wireDraft.points = [start, { x: endX, y: endY }];
       }
       this.wireDraft.valid = valid;
@@ -374,21 +447,23 @@ export class Editor {
       const dxPx = sp.x - this.drag.startScreen.x, dyPx = sp.y - this.drag.startScreen.y;
       if (!this.drag.moved && Math.hypot(dxPx, dyPx) > MOVE_THRESHOLD_PX) this.drag.moved = true;
       if (this.drag.moved) {
-        const snap = this._snap(wp.x, wp.y);
         const { wire, segIndex, segDir, origPoints } = this.drag;
         const path = wirePath(this.circuit, wire);
         if (path) {
-          const newCoord = segDir === 'h' ? snap.y : snap.x;
-          wire.points = this._computeDraggedPoints(origPoints, path[0], path[path.length - 1], segIndex, segDir, newCoord);
+          const pinStart = path[0], pinEnd = path[path.length - 1];
+          const snapped = this._snapForWire(wp.x, wp.y, [pinStart, pinEnd]);
+          const newCoord = segDir === 'h' ? snapped.y : snapped.x;
+          wire.points = this._computeDraggedPoints(origPoints, pinStart, pinEnd, segIndex, segDir, newCoord);
         }
       }
       return;
     }
-
-    if (this.drag?.kind === 'pan') {
-      const dx = sp.x - this.drag.lastX, dy = sp.y - this.drag.lastY;
-      this.camera.panX += dx; this.camera.panY += dy;
-      this.drag.lastX = sp.x; this.drag.lastY = sp.y;
+    
+    if (this.drag?.kind === 'slider') {
+      const { inst, def, track } = this.drag;
+      const t = Math.max(0, Math.min(1, (wp.x - track.x0) / (track.x1 - track.x0)));
+      inst.state = def.onSliderInput(inst.state, inst.params || {}, t);
+      this.drag.moved = true;
       return;
     }
 
@@ -402,7 +477,15 @@ export class Editor {
           const inst = this.circuit.getComponent(id);
           if (inst) { inst.x = start.x + dx; inst.y = start.y + dy; }
         }
+        this._reflowWires(this.drag.startPositions);
       }
+      return;
+    }
+
+    if (this.drag?.kind === 'pan') {
+      const dx = sp.x - this.drag.lastX, dy = sp.y - this.drag.lastY;
+      this.camera.panX += dx; this.camera.panY += dy;
+      this.drag.lastX = sp.x; this.drag.lastY = sp.y;
       return;
     }
 
@@ -411,13 +494,14 @@ export class Editor {
       return;
     }
 
-    // idle hover detection
+    // idle hover detection (nur Tooltip/Cursor, startet KEIN Kabel)
     const pinHit = this._findPinAt(wp.x, wp.y);
     if (pinHit) {
       const bits = pinHit.pin.dir === 'out'
         ? this.instanceOutputs.get(pinHit.inst.id)?.[pinHit.pin.id]
         : (() => { const w = this.circuit.wireInto(pinHit.inst.id, pinHit.pin.id); return w ? this.wireValues.get(w.id) : null; })();
-      this.hover = { type: 'pin', sp: worldToScreen(this.camera, pinHit.x, pinHit.y), bits, label: `${pinHit.inst.label || pinHit.inst.type}.${pinHit.pin.label || pinHit.pin.id}` };
+      const typeLabel = getComponentType(pinHit.inst.type)?.label || pinHit.inst.type;
+      this.hover = { type: 'pin', sp: worldToScreen(this.camera, pinHit.x, pinHit.y), bits, label: `${pinHit.inst.label || typeLabel}.${pinHit.pin.label || pinHit.pin.id}` };
       this.canvas.style.cursor = 'crosshair';
       return;
     }
@@ -425,16 +509,28 @@ export class Editor {
     if (compHit) {
       this.hover = { type: 'component', id: compHit.id };
       const def = getComponentType(compHit.type);
-      this.canvas.style.cursor = def?.interactive ? 'pointer' : 'move';
+      let cursor = def?.interactive ? 'pointer' : 'move';
+      if (def?.onSliderInput) {
+        const track = sliderTrackRect(compHit);
+        if (Math.abs(wp.y - track.y) <= 0.5 && wp.x >= track.x0 - 0.3 && wp.x <= track.x1 + 0.3) cursor = 'ew-resize';
+      }
+      this.canvas.style.cursor = cursor;
       return;
     }
     this.hover = null;
     this.canvas.style.cursor = this.keys.space ? 'grab' : 'default';
   }
-
+  
+  
   _onPointerUp(e) {
     if (this.drag?.kind === 'wire-seg') {
       if (this.drag.moved) this.pushHistory();
+      this.drag = null;
+      return;
+    }
+    
+    if (this.drag?.kind === 'slider') {
+      if (this.drag.moved || this.drag.inst.state?.value !== this.drag.prevValue) this.pushHistory();
       this.drag = null;
       return;
     }
@@ -449,11 +545,38 @@ export class Editor {
       const sp = this._screenPos(e);
       const wp = screenToWorld(this.camera, sp.x, sp.y);
       const hit = this._findPinAt(wp.x, wp.y);
-      this.canvas.classList.remove('mode-wiring');
       if (hit && this._pinsCompatible(this.wireDraft.startInst, this.wireDraft.startPin, hit.inst, hit.pin)) {
-        this._connect(this.wireDraft.startInst, this.wireDraft.startPin, hit.inst, hit.pin);
+        this._connect(this.wireDraft.startInst, this.wireDraft.startPin, hit.inst, hit.pin, this.wireDraft.corners);
+        this.wireDraft = null;
+        this.canvas.classList.remove('mode-wiring');
+        return;
       }
-      this.wireDraft = null;
+
+      const gestureStart = this.wireDraft.gestureDownScreen || sp;
+      const movedPx = Math.hypot(sp.x - gestureStart.x, sp.y - gestureStart.y);
+      const isFirstSegment = this.wireDraft.corners.length === 0;
+
+      if (movedPx > MOVE_THRESHOLD_PX && isFirstSegment) {
+        // echtes Ziehen direkt vom Start-Pin ins Leere -> Kabel verwerfen
+        this.wireDraft = null;
+        this.canvas.classList.remove('mode-wiring');
+        return;
+      }
+
+      // Klick (oder Ziehen nach der ersten Ecke) ins Leere -> Eckpunkt setzen
+      // Auch hier auf exakte (ggf. nicht-ganzzahlige) Pin-Positionen einrasten,
+      // nicht nur beim nachträglichen Verschieben eines Segments.
+      const nearPin = this._findPinAt(wp.x, wp.y);
+      const refPins = [this.wireDraft.start];
+      if (nearPin) refPins.push({ x: nearPin.x, y: nearPin.y });
+      const snap = this._snapForWire(wp.x, wp.y, refPins);
+      const last = this.wireDraft.corners[this.wireDraft.corners.length - 1] || this.wireDraft.points[0];
+      if (Math.hypot(snap.x - last.x, snap.y - last.y) > 0.01) {
+        if (this.orthoMode && Math.abs(snap.x - last.x) > 0.01 && Math.abs(snap.y - last.y) > 0.01) {
+          this.wireDraft.corners.push({ x: snap.x, y: last.y, auto: true });
+        }
+        this.wireDraft.corners.push({ x: snap.x, y: snap.y });
+      }
       return;
     }
 
@@ -509,23 +632,82 @@ export class Editor {
     return true;
   }
 
-  _connect(instA, pinA, instB, pinB) {
+  // Erstellt das endgültige Wire-Objekt. corners sind ausschließlich vom Nutzer per Klick
+  // gesetzte Zwischenpunkte (nur im Ortho-Modus möglich); im Nicht-Ortho-Modus ist das Array
+  // immer leer, wodurch garantiert eine reine Pin-zu-Pin-Gerade entsteht.
+  _connect(instA, pinA, instB, pinB, extraPoints = []) {
     const [srcInst, srcPin, tgtInst, tgtPin] = pinA.dir === 'out' ? [instA, pinA, instB, pinB] : [instB, pinB, instA, pinA];
     const existing = this.circuit.wireInto(tgtInst.id, tgtPin.id);
     if (existing) this.circuit.removeWire(existing.id);
 
-    let points = [];
-    if (this.orthoMode) {
-      const src = pinWorldPos(srcInst, srcPin.id);
-      const tgt = pinWorldPos(tgtInst, tgtPin.id);
-      if (src && tgt && (Math.abs(src.x - tgt.x) > 0.01 || Math.abs(src.y - tgt.y) > 0.01)) {
-        // L-shape: go horizontal first, then vertical
-        points = [{ x: tgt.x, y: src.y }];
+    const src = pinWorldPos(srcInst, srcPin.id);
+    const tgt = pinWorldPos(tgtInst, tgtPin.id);
+
+    let points;
+    if (!this.orthoMode) {
+      // Nicht-Ortho: garantiert keine Zwischenpunkte, egal was extraPoints enthält.
+      points = [];
+    } else {
+      let corners = extraPoints.map((p) => ({ ...p }));
+      if (pinA.dir !== 'out') corners = corners.reverse();
+
+      // Auch ganz ohne manuell gesetzte Ecken: liegen Start und Ziel nicht auf einer
+      // gemeinsamen Achse, MUSS ein Elbow-Punkt eingefügt werden - Kabel bleiben
+      // in Ortho-Modus immer strikt horizontal/vertikal, ohne Ausnahme.
+      if (corners.length === 0 && src && tgt &&
+          Math.abs(src.x - tgt.x) > 0.01 && Math.abs(src.y - tgt.y) > 0.01) {
+        corners = [{ x: tgt.x, y: src.y, auto: true }];
       }
+      points = (src && tgt) ? simplifyPoints([src, ...corners, tgt]).slice(1, -1) : corners;
     }
 
     this.circuit.addWire(new Wire({ from: { compId: srcInst.id, pinId: srcPin.id }, to: { compId: tgtInst.id, pinId: tgtPin.id }, points }));
     this.pushHistory();
+  }
+
+  // Verschiebt Zwischenpunkte, die auf derselben Höhe/Breite wie ein bewegtes
+  // Pin lagen, um denselben Versatz mit - automatische wie manuell gesetzte
+  // Ecken gleichermaßen. Berechnung erfolgt jeden Frame neu ausgehend vom
+  // Zustand bei Drag-Beginn (wireSnapshots), damit nichts kumulativ driftet.
+  _reflowWires(movedIds) {
+    const snapshots = this.drag?.wireSnapshots;
+    const TOL = 0.05;
+    for (const wire of this.circuit.wires) {
+      if (!movedIds.has(wire.from.compId) && !movedIds.has(wire.to.compId)) continue;
+      const fromInst = this.circuit.getComponent(wire.from.compId);
+      const toInst = this.circuit.getComponent(wire.to.compId);
+      if (!fromInst || !toInst) continue;
+      const src = pinWorldPos(fromInst, wire.from.pinId);
+      const tgt = pinWorldPos(toInst, wire.to.pinId);
+      if (!src || !tgt) continue;
+
+      const snap = snapshots?.get(wire.id);
+
+      if (!snap || snap.origPoints.length === 0) {
+        if (this.orthoMode && Math.abs(src.x - tgt.x) > 0.01 && Math.abs(src.y - tgt.y) > 0.01) {
+          wire.points = [{ x: tgt.x, y: src.y, auto: true }];
+        } else if (snap) {
+          wire.points = [];
+        }
+        continue;
+      }
+
+      if (!this.orthoMode) continue; // im Nicht-Ortho-Modus keine Zwischenpunkte anfassen
+
+      const dxSrc = src.x - snap.oldSrc.x, dySrc = src.y - snap.oldSrc.y;
+      const dxTgt = tgt.x - snap.oldTgt.x, dyTgt = tgt.y - snap.oldTgt.y;
+
+      const shifted = snap.origPoints.map((p) => {
+        const np = { ...p };
+        if (Math.abs(p.x - snap.oldSrc.x) < TOL) np.x += dxSrc;
+        else if (Math.abs(p.x - snap.oldTgt.x) < TOL) np.x += dxTgt;
+        if (Math.abs(p.y - snap.oldSrc.y) < TOL) np.y += dySrc;
+        else if (Math.abs(p.y - snap.oldTgt.y) < TOL) np.y += dyTgt;
+        return np;
+      });
+
+      wire.points = simplifyPoints([src, ...shifted, tgt]).slice(1, -1);
+    }
   }
 
   // Recompute waypoints after dragging one segment.
@@ -534,6 +716,9 @@ export class Editor {
   // segIdx: index of the dragged segment in the FULL path [pinStart, ...origPoints, pinEnd]
   // segDir: 'h' (horizontal segment, drag changes y) | 'v' (vertical, drag changes x)
   // newCoord: snapped target coordinate (y for 'h', x for 'v')
+  // Nach der Neuberechnung laufen die Punkte immer durch simplifyPoints, wodurch Punkte,
+  // die durch das Verschieben redundant (kollinear zu ihren Nachbarn) geworden sind,
+  // automatisch entfernt werden.
   _computeDraggedPoints(origPoints, pinStart, pinEnd, segIdx, segDir, newCoord) {
     const path = [pinStart, ...origPoints.map((p) => ({ ...p })), pinEnd];
     const n = path.length;
@@ -557,14 +742,20 @@ export class Editor {
       path.splice(last, 0, { [coord]: newCoord, [otherCoord]: path[last][otherCoord] });
     }
 
-    return path.slice(1, -1); // strip pin endpoints → only movable waypoints
+    return simplifyPoints(path).slice(1, -1); // strip pin endpoints → nur bereinigte, redundanzfreie Wegpunkte
   }
 
   toggleOrthoMode() {
     this.orthoMode = !this.orthoMode;
     localStorage.setItem('logicforge:orthoMode', this.orthoMode ? '1' : '0');
     this._updateOrthoButton();
-    toast(this.orthoMode ? 'Ortho-Modus aktiv — Kabel laufen nur waagrecht/senkrecht' : 'Ortho-Modus deaktiviert', 'info');
+    // Ein laufender Kabel-Entwurf wird beim Umschalten verworfen, damit nie ein
+    // Entwurf mit inkonsistenten Zwischenpunkten (Ortho <-> Nicht-Ortho) übrig bleibt.
+    if (this.wireDraft) {
+      this.wireDraft = null;
+      this.canvas.classList.remove('mode-wiring');
+    }
+    toast(this.orthoMode ? 'Ortho-Modus aktiv — Kabel laufen nur waagrecht/senkrecht' : 'Ortho-Modus deaktiviert — nur direkte Pin-zu-Pin-Verbindungen', 'info');
   }
 
   _updateOrthoButton() {
@@ -577,7 +768,7 @@ export class Editor {
     const sp = this._screenPos(e);
     const before = screenToWorld(this.camera, sp.x, sp.y);
     const factor = Math.exp(-e.deltaY * 0.0012);
-    this.camera.zoom = Math.min(3, Math.max(0.25, this.camera.zoom * factor));
+    this.camera.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this.camera.zoom * factor));
     this.camera.panX = sp.x - before.x * GRID * this.camera.zoom;
     this.camera.panY = sp.y - before.y * GRID * this.camera.zoom;
   }
@@ -603,7 +794,13 @@ export class Editor {
     if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); this.selection = new Set([...this.circuit.components.map((c) => c.id), ...this.circuit.wires.map((w) => w.id)]); this.refreshPanels(); return; }
     if (mod && e.key.toLowerCase() === 'c') { this.copySelection(); return; }
     if (mod && e.key.toLowerCase() === 'v') { this.pasteClipboard(); return; }
-    if (e.key === 'Escape') { this._setPlacing(null); this.wireDraft = null; this.selection = new Set(); this.refreshPanels(); return; }
+    if (e.key === 'Escape') {
+      this._setPlacing(null);
+      if (this.wireDraft) { this.wireDraft = null; this.canvas.classList.remove('mode-wiring'); }
+      this.selection = new Set();
+      this.refreshPanels();
+      return;
+    }
     if (e.key === 'Delete' || e.key === 'Backspace') { this.deleteSelection(); return; }
     if (e.key.toLowerCase() === 'r') { this.rotateSelection(); return; }
     if (e.key.toLowerCase() === 'o') { this.toggleOrthoMode(); return; }
@@ -698,7 +895,7 @@ export class Editor {
   zoomBy(factor) {
     const cx = this._cssW / 2, cy = this._cssH / 2;
     const before = screenToWorld(this.camera, cx, cy);
-    this.camera.zoom = Math.min(3, Math.max(0.25, this.camera.zoom * factor));
+    this.camera.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, this.camera.zoom * factor));
     this.camera.panX = cx - before.x * GRID * this.camera.zoom;
     this.camera.panY = cy - before.y * GRID * this.camera.zoom;
   }
@@ -717,7 +914,7 @@ export class Editor {
     minX -= pad; minY -= pad; maxX += pad; maxY += pad;
     const zoomX = this._cssW / ((maxX - minX) * GRID);
     const zoomY = this._cssH / ((maxY - minY) * GRID);
-    this.camera.zoom = Math.min(2.5, Math.max(0.25, Math.min(zoomX, zoomY)));
+    this.camera.zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min(zoomX, zoomY)));
     this.camera.panX = -minX * GRID * this.camera.zoom + (this._cssW - (maxX - minX) * GRID * this.camera.zoom) / 2;
     this.camera.panY = -minY * GRID * this.camera.zoom + (this._cssH - (maxY - minY) * GRID * this.camera.zoom) / 2;
   }

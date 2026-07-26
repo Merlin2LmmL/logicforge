@@ -115,6 +115,95 @@ registerComponentType({
   },
 });
 
+registerComponentType({
+  type: 'COUNTER',
+  category: 'Speicher',
+  label: 'Zähler',
+  color: '#f0a35e',
+  paramsSchema: [{ key: 'width', label: 'Bitbreite', kind: 'int', min: 1, max: 32, step: 1, default: 8 }],
+  pins: (params) => [
+    { id: 'clk', label: '>', dir: 'in', width: 1, side: 'left', order: 0 },
+    { id: 'en', label: 'EN', dir: 'in', width: 1, side: 'left', order: 1 },
+    { id: 'rst', label: 'R', dir: 'in', width: 1, side: 'left', order: 2 },
+    { id: 'dir', label: 'UP/DN', dir: 'in', width: 1, side: 'left', order: 3 },
+    { id: 'q', label: 'Q', dir: 'out', width: params.width ?? 8, side: 'right', order: 0 },
+    { id: 'tc', label: 'TC', dir: 'out', width: 1, side: 'right', order: 1 },
+  ],
+  size: () => ({ w: 4, h: 5 }),
+  init: () => ({ value: 0, prevClk: 0 }),
+  // TC (Terminal Count) geht auf 1, sobald der Zähler seinen Endwert erreicht -
+  // nützlich zum Kaskadieren mehrerer Zähler zu breiteren Zählketten.
+  evaluate: ({ inputs, state, params }) => {
+    const width = params.width ?? 8;
+    const max = 2 ** width;
+    const clk = ctrl(inputs.clk?.[0], 0);
+    const en = ctrl(inputs.en?.[0], 1);
+    const rst = ctrl(inputs.rst?.[0], 0);
+    const dir = ctrl(inputs.dir?.[0], 1); // 1 = hoch (Standard), 0 = runter
+    let value = state.value ?? 0;
+    const rising = state.prevClk === 0 && clk === 1;
+    if (rst === 1) {
+      value = 0;
+    } else if (en === 1 && rising) {
+      value = dir === 1 ? (value + 1) % max : (value - 1 + max) % max;
+    }
+    const tc = dir === 1 ? (value === max - 1 ? 1 : 0) : (value === 0 ? 1 : 0);
+    return { outputs: { q: fromInt(value, width), tc: [tc] }, state: { value, prevClk: clk } };
+  },
+});
+
+registerComponentType({
+  type: 'SHIFTREG',
+  category: 'Speicher',
+  label: 'Schieberegister',
+  color: '#f0a35e',
+  paramsSchema: [
+    { key: 'width', label: 'Bitbreite', kind: 'int', min: 1, max: 32, step: 1, default: 8 },
+    { key: 'direction', label: 'Richtung', kind: 'select', options: ['left', 'right'], default: 'left' },
+  ],
+  pins: (params) => [
+    { id: 'd', label: 'D', dir: 'in', width: params.width ?? 8, side: 'left', order: 0 },
+    { id: 'sin', label: 'SIN', dir: 'in', width: 1, side: 'left', order: 1 },
+    { id: 'clk', label: '>', dir: 'in', width: 1, side: 'left', order: 2 },
+    { id: 'en', label: 'EN', dir: 'in', width: 1, side: 'left', order: 3 },
+    { id: 'ld', label: 'LD', dir: 'in', width: 1, side: 'left', order: 4 },
+    { id: 'rst', label: 'R', dir: 'in', width: 1, side: 'left', order: 5 },
+    { id: 'q', label: 'Q', dir: 'out', width: params.width ?? 8, side: 'right', order: 0 },
+    { id: 'sout', label: 'SOUT', dir: 'out', width: 1, side: 'right', order: 1 },
+  ],
+  size: () => ({ w: 4, h: 6 }),
+  init: () => ({ value: 0, prevClk: 0 }),
+  evaluate: ({ inputs, state, params }) => {
+    const width = params.width ?? 8;
+    const dir = params.direction ?? 'left';
+    const clk = ctrl(inputs.clk?.[0], 0);
+    const en = ctrl(inputs.en?.[0], 1);
+    const rst = ctrl(inputs.rst?.[0], 0);
+    const ld = ctrl(inputs.ld?.[0], 0);
+    const sin = ctrl(inputs.sin?.[0], 0);
+    let value = state.value ?? 0;
+    let soutBit = dir === 'left' ? (value >> (width - 1)) & 1 : value & 1;
+    const rising = state.prevClk === 0 && clk === 1;
+    const mask = width >= 31 ? 0xFFFFFFFF : (2 ** width - 1);
+    if (rst === 1) {
+      value = 0;
+    } else if (en === 1 && rising) {
+      if (ld === 1) {
+        const dBits = inputs.d || new Array(width).fill(FLOATING);
+        const v = toInt(dBits);
+        if (v !== null) value = v;
+      } else if (dir === 'left') {
+        soutBit = (value >> (width - 1)) & 1;
+        value = ((value << 1) | (sin ? 1 : 0)) & mask;
+      } else {
+        soutBit = value & 1;
+        value = ((value >>> 1) | ((sin ? 1 : 0) << (width - 1))) & mask;
+      }
+    }
+    return { outputs: { q: fromInt(value, width), sout: [soutBit] }, state: { value, prevClk: clk } };
+  },
+});
+
 function presetToMem(params) {
   const addrWidth = Math.min(params.addrWidth ?? 4, MAX_ADDR_BITS);
   const size = 2 ** addrWidth;

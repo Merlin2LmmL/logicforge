@@ -13,7 +13,7 @@ registerComponentType({
     for (let i = 0; i < width; i++) pins.push({ id: `b${i}`, label: `${i}`, dir: 'out', width: 1, side: 'right', order: i });
     return pins;
   },
-  size: (params) => ({ w: 3, h: Math.max(2, params.width ?? 8) }),
+  size: (params) => ({ w: 4, h: Math.max(2, params.width ?? 8) }),
   init: () => ({}),
   evaluate: ({ inputs, params }) => {
     const width = params.width ?? 8;

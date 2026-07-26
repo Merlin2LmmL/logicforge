@@ -104,3 +104,25 @@ registerComponentType({
     return { outputs: { out: a.slice() }, state: {} };
   },
 });
+
+registerComponentType({
+  type: 'TRISTATE',
+  category: 'Gatter',
+  label: 'Tri-State-Buffer',
+  color: '#7fd67f',
+  paramsSchema: [{ key: 'width', label: 'Bitbreite', kind: 'int', min: 1, max: 32, step: 1, default: 1 }],
+  pins: (params) => [
+    { id: 'in0', label: 'A', dir: 'in', width: params.width ?? 1, side: 'left', order: 0 },
+    { id: 'en', label: 'EN', dir: 'in', width: 1, side: 'bottom', order: 0 },
+    { id: 'out', label: 'Y', dir: 'out', width: params.width ?? 1, side: 'right', order: 0 },
+  ],
+  size: () => ({ w: 3, h: 2 }),
+  init: () => ({}),
+  evaluate: ({ inputs, params }) => {
+    const width = params.width ?? 1;
+    const en = inputs.en?.[0] === 1;
+    if (!en) return { outputs: { out: new Array(width).fill(FLOATING) }, state: {} };
+    const a = inputs.in0 || new Array(width).fill(FLOATING);
+    return { outputs: { out: a.slice() }, state: {} };
+  },
+});
