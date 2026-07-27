@@ -35,18 +35,21 @@ export function computeLayout(inst) {
   const positions = new Map();
   for (const [side, list] of Object.entries(bySide)) {
     const n = list.length;
-    list.forEach((p, idx) => {
-      let x, y;
-      if (side === 'left' || side === 'right') {
-        y = Math.round(((idx + 1) * h) / (n + 1));
-        x = side === 'left' ? 0 : w;
-      } else {
-        x = Math.round(((idx + 1) * w) / (n + 1));
-        y = side === 'top' ? 0 : h;
-      }
-      positions.set(p.id, {x, y, side});
-    });
-  }
+		list.forEach((p, idx) => {
+		  let x, y;
+  			if (side === 'left' || side === 'right') {
+  			  const available = h - 2; // Abstand von Rand oben/unten
+		    const step = available / Math.max(1, n - 1);
+		    y = 1 + Math.round(idx * step);
+    			x = side === 'left' ? 0 : w;
+  			} else {
+    			const available = w - 2;
+    			const step = available / Math.max(1, n - 1);
+    			x = 1 + Math.round(idx * step);
+    			y = side === 'top' ? 0 : h;
+  			}
+  			positions.set(p.id, {x, y, side});
+		});
   return { pins, w, h, positions, def };
 }
 
