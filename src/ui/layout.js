@@ -26,19 +26,25 @@ export function computeLayout(inst) {
   const pins = def.pins(inst.params || {});
   const { w, h } = effectiveSize(def, inst);
   const bySide = { left: [], right: [], top: [], bottom: [] };
-  for (const p of pins) bySide[rotateSide(p.side, inst.rot)].push(p);
-  for (const k of Object.keys(bySide)) bySide[k].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  for (const p of pins) {
+    bySide[rotateSide(p.side, inst.rot)].push(p);
+  }
+  for (const k of Object.keys(bySide)) {
+    bySide[k].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  }
   const positions = new Map();
   for (const [side, list] of Object.entries(bySide)) {
     const n = list.length;
     list.forEach((p, idx) => {
-      const t = (idx + 1) / (n + 1);
       let x, y;
-      if (side === 'left') { x = 0; y = t * h; }
-      else if (side === 'right') { x = w; y = t * h; }
-      else if (side === 'top') { x = t * w; y = 0; }
-      else { x = t * w; y = h; }
-      positions.set(p.id, { x, y, side });
+      if (side === 'left' || side === 'right') {
+        y = Math.round(((idx + 1) * h) / (n + 1));
+        x = side === 'left' ? 0 : w;
+      } else {
+        x = Math.round(((idx + 1) * w) / (n + 1));
+        y = side === 'top' ? 0 : h;
+      }
+      positions.set(p.id, {x, y, side});
     });
   }
   return { pins, w, h, positions, def };
