@@ -35,21 +35,37 @@ export function computeLayout(inst) {
   const positions = new Map();
   for (const [side, list] of Object.entries(bySide)) {
     const n = list.length;
-		list.forEach((p, idx) => {
-		  let x, y;
-  			if (side === 'left' || side === 'right') {
-  			  const available = h - 2; // Abstand von Rand oben/unten
-		    const step = available / Math.max(1, n - 1);
-		    y = 1 + Math.round(idx * step);
-    			x = side === 'left' ? 0 : w;
-  			} else {
-    			const available = w - 2;
-    			const step = available / Math.max(1, n - 1);
-    			x = 1 + Math.round(idx * step);
-    			y = side === 'top' ? 0 : h;
-  			}
-  			positions.set(p.id, {x, y, side});
-		});
+    if (n === 0) continue;
+
+    const isVertical = side === 'left' || side === 'right';
+    const span = (isVertical ? h : w) - 2; // Platz zwischen den Rand-Einheiten oben/unten bzw. links/rechts
+    const blockLen = n - 1; // Länge des Pin-Blocks bei Pitch = 1
+
+    // Block zentrieren, dabei innerhalb [0, span] clampen, falls die
+    // Komponente für die Pin-Anzahl eigentlich zu klein ist.
+    const clampedBlockLen = Math.min(blockLen, Math.max(0, span));
+    let start = Math.round((span - clampedBlockLen) / 2);
+    start = Math.max(0, Math.min(start, span - clampedBlockLen));
+    start += 1; // ursprünglicher 1er-Rand
+
+    // Falls die Komponente kleiner ist als n Pins brauchen (blockLen > span),
+    // wird der Pitch reduziert, damit trotzdem alles reinpasst, ohne zu überlappen
+    // – aber wir runden erst am Ende jeder Position, nicht kumulativ.
+    const pitch = blockLen > 0 ? Math.min(1, clampedBlockLen / blockLen) : 1;
+
+    list.forEach((p, idx) => {
+      const pos = Math.round(start + idx * pitch);
+      let x, y;
+      if (isVertical) {
+        y = pos;
+        x = side === 'left' ? 0 : w;
+      } else {
+        x = pos;
+        y = side === 'top' ? 0 : h;
+      }
+      positions.set(p.id, { x, y, side });
+    });
+  }
   return { pins, w, h, positions, def };
 }
 
