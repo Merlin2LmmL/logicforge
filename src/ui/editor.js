@@ -60,19 +60,16 @@ function circuitHasActiveClock(components, seenTypes = new Set()) {
 }
 
 // Sammelt Periode und Pulsdauer jeder aktiven (hz>0) Clock in der Schaltung (rekursiv wie
-// circuitHasActiveClock), damit die Sub-Schritt-Auflösung sich an die tatsächlich
-// vorhandenen Taktfrequenzen anpassen kann, statt immer eine feste, sehr feine Schrittweite
-// zu erzwingen. Ohne das würde selbst eine einzelne 1-Hz-Clock mit derselben ~1µs-Auflösung
-// simuliert wie ein 1-MHz-Takt: ~16000 volle settleCircuit()-Durchläufe (je mit bis zu 48
-// internen Iterationen) PRO BILDSCHIRM-FRAME, obwohl ein 1-Hz-Takt pro Frame vielleicht 1-2
-// Auswertungen bräuchte. Das sprengte routinemäßig das Zeitbudget in _frame(), wodurch die
-// Simulation dauerhaft hinter der Wanduhr zurückblieb (eine 1-Hz-Clock blinkte dadurch z.B.
-// nur alle paar Sekunden statt jede Sekunde) - UND weil dabei trotzdem in tausenden winzigen
-// 1µs-Schritten durch ein einzelnes, sehr viel breiteres "sichtbares Blinken" (z.B. eine
-// 1ms-Pulsdauer) hindurchgetreten wurde, bekamen nachgeschaltete Bauteile (Zähler etc.) für
-// ein einziges Blinken tausende separate settleCircuit()-Aufrufe zu sehen statt einer
-// einzelnen sauberen Flanke.
-function collectActiveClockFeatures(components, seenTypes = new Set(), out = []) {
+// circuitHasActiveClock), damit die Simulation direkt zur nächsten tatsächlichen Taktflanke
+// springen kann (event-driven), statt die Zeit in einem festen/adaptiven Raster
+// abzutasten. Ein fest gerastertes Sampling wertet die Schaltung auch dann ständig neu aus,
+// wenn sich zwischen zwei Flanken gar nichts ändert (z.B. tausende Aufrufe während der
+// "flachen" Hälfte einer 1-Hz-Clock) - das war die eigentliche Ursache dafür, dass selbst
+// wenige Bauteile spürbar ruckelten und die Simulation bei hoher Taktfrequenz immer weiter
+// hinter der Wanduhr zurückfiel: jeder Sub-Schritt kostet einen vollen settleCircuit()-Lauf
+// (Map-Allokationen + bis zu 48 interne Fixpunkt-Iterationen), egal ob sich dabei überhaupt
+// etwas ändert.
+function collectActiveClocks(components, seenTypes = new Set(), out = []) {
   for (const inst of components) {
     const def = getComponentType(inst.type);
     if (!def) continue;
@@ -81,7 +78,7 @@ function collectActiveClockFeatures(components, seenTypes = new Set(), out = [])
       if (hz > 0) {
         const period = 1000 / hz;
         const pulse = Math.min(inst.params?.pulseMs > 0 ? inst.params.pulseMs : period / 2, period);
-        out.push(pulse, Math.max(period - pulse, 0.000001));
+        out.push({ period, pulse: Math.max(pulse, 0.000001) });
       }
       continue;
     }
@@ -90,11 +87,25 @@ function collectActiveClockFeatures(components, seenTypes = new Set(), out = [])
       seenTypes.add(inst.type);
       const libDef = getDefinition(inst.type);
       if (libDef?.kind === 'composite' && libDef.circuit?.components?.length) {
-        collectActiveClockFeatures(libDef.circuit.components, seenTypes, out);
+        collectActiveClocks(libDef.circuit.components, seenTypes, out);
       }
     }
   }
   return out;
+}
+
+// Zeit (in ms virtueller Simulationszeit) bis zur nächsten Flanke irgendeiner der
+// übergebenen Clocks, ausgehend von `now`. Nutzt dieselbe Phasenformel wie Clock.evaluate
+// in components/io.js (elapsed = now mod period, high solange elapsed < pulse), sodass die
+// hier berechneten Sprungziele exakt mit den tatsächlichen Pegelwechseln übereinstimmen.
+function timeToNextClockEdge(now, clocks) {
+  let best = Infinity;
+  for (const { period, pulse } of clocks) {
+    const phase = ((now % period) + period) % period;
+    const toEdge = phase < pulse ? pulse - phase : period - phase;
+    if (toEdge < best) best = toEdge;
+  }
+  return best;
 }
 
 export class Editor {
@@ -288,59 +299,43 @@ export class Editor {
     } else {
       // Es gibt (mindestens) einen echten, laufenden Taktgeber - dessen Impulse dürfen
       // nicht "verschluckt" werden, auch wenn er viel schneller tickt als der Bildschirm
-      // Frames liefert. Dafür weiterhin Sub-Schritte in virtueller Zeit, aber mit einer
-      // an die tatsächlich vorhandenen Taktfrequenzen ANGEPASSTEN Schrittweite statt einer
-      // fest verdrahteten 1µs-Auflösung: eine einzelne 1-Hz-Clock braucht pro Frame vielleicht
-      // 1-2 Auswertungen, kein 1µs-Rasterung über die vollen ~16ms - genau das zwang vorher
-      // JEDE aktive Clock (egal wie langsam) auf ~16000 volle settleCircuit()-Durchläufe pro
-      // Frame, was das Zeitbudget unten sprengte und die Simulation dauerhaft hinter der
-      // Wanduhr zurückfallen ließ (eine 1-Hz-Clock blinkte dadurch nur noch alle paar
-      // Sekunden), UND weil dabei trotzdem in winzigen Schritten durch ein einzelnes,
-      // deutlich breiteres Blinken (z.B. 1ms Pulsdauer) hindurchgetreten wurde, sah alles
-      // Nachgeschaltete (Zähler etc.) für ein sichtbares Blinken tausende separate
-      // settleCircuit()-Aufrufe statt einer einzelnen sauberen Flanke.
-      const features = collectActiveClockFeatures(this.circuit.components);
-      // Obergrenze für die Schrittweite: höchstens halb so breit wie das schmalste
-      // vorhandene Feature (Puls oder Gegen-Puls), damit auch der schmalste Puls
-      // garantiert mindestens einmal getroffen wird, egal wie niedrig die Grundfrequenz ist.
-      const neededRes = features.length ? Math.min(...features) / 2 : this.simStepMs;
-      // Untergrenze für die Schrittweite: genug, um den maxSubStepsPerFrame-Deckel
-      // einzuhalten, falls neededRes bei hoher Taktfrequenz + großem simDeltaMs (z.B. nach
-      // einer Zeitbudget-Unterbrechung im vorigen Frame) zu viele Schritte verlangen würde -
-      // in dem Fall wird die Auflösung kontrolliert vergröbert (graceful degradation) statt
-      // die Schleife beliebig lang laufen zu lassen.
+      // Frames liefert. Statt die virtuelle Zeit in einem festen oder adaptiven Raster
+      // abzutasten (was JEDE aktive Clock, egal wie langsam, zu tausenden unnötigen
+      // settleCircuit()-Aufrufen zwang, auch während der "flachen" Hälfte einer 1-Hz-Clock,
+      // in der sich gar nichts ändert), springen wir direkt zur jeweils NÄCHSTEN echten
+      // Flanke: pro Frame genau ein settleCircuit()-Aufruf pro tatsächlichem Pegelwechsel
+      // (plus einem abschließenden Aufruf am Frame-Ende, der auch andere interaktive
+      // Bauteile wie Switches/Buttons aktuell hält). Das macht eine langsame Clock praktisch
+      // kostenlos (2 Aufrufe/Sekunde statt 2 Aufrufe/Sekunde * zigtausend Zwischenschritten)
+      // und lässt eine sehr hohe Frequenz genau so viele Aufrufe kosten, wie sie an echten
+      // Flanken tatsächlich hat - nicht mehr, nicht weniger.
+      const clocks = collectActiveClocks(this.circuit.components);
       const simDeltaMs = realDeltaMs * this.simSpeed + this._simDebtMs;
-      const capStep = simDeltaMs / this.maxSubStepsPerFrame;
-      const stepMs = Math.max(this.simStepMs, neededRes, capStep);
-      let remaining = simDeltaMs;
+      const deadline = this.simTime + simDeltaMs;
       wireValues = this.wireValues;
       instanceOutputs = this.instanceOutputs;
 
-      // Zeitbudget als Sicherheitsnetz: auch mit einem echten (u.U. sehr hochfrequenten)
-      // Takt darf ein einzelner Frame nicht beliebig lange rechnen, sonst friert bei einer
-      // großen Schaltung + hoher Taktfrequenz trotzdem die UI ein. Wird das Budget
-      // aufgebraucht, bricht die Schleife ab; die noch nicht verarbeitete virtuelle Zeit
-      // wird als `_simDebtMs` für den nächsten Frame vorgemerkt statt verworfen, damit die
+      // Zeitbudget als Sicherheitsnetz: bei sehr hoher Taktfrequenz + großer/komplexer
+      // Schaltung kann die Zahl der Flanken in einem Frame trotzdem zu groß werden, um sie
+      // alle in nützlicher Zeit abzuarbeiten - dann bricht die Schleife ab, statt die UI
+      // einfrieren zu lassen. Die noch nicht verarbeitete virtuelle Zeit wird als
+      // `_simDebtMs` für den nächsten Frame vorgemerkt statt verworfen, damit die
       // Simulation über mehrere Frames hinweg wieder zur Echtzeit aufschließt statt
       // dauerhaft mit reduzierter Geschwindigkeit weiterzulaufen.
       const budgetDeadline = performance.now() + 8;
       let iters = 0;
-      while (remaining > 0) {
-        // Der letzte Schritt eines Frames wird auf `remaining` gekappt: stepMs kann bei
-        // einer niederfrequenten Clock (großes neededRes, z.B. 250ms bei einer 1-Hz-Clock
-        // mit 50% Tastgrad) durchaus größer sein als das, was diesen Frame an virtueller
-        // Zeit tatsächlich "zusteht" (simDeltaMs, typischerweise ~16ms) - ohne diese
-        // Kappung würde simTime in einem einzigen Sprung weiter vorrücken, als seit dem
-        // letzten Frame real Zeit vergangen ist, und die Clock liefe zu schnell statt zu
-        // langsam.
-        const s = Math.min(stepMs, remaining);
-        this.simTime += s;
-        remaining -= s;
+      while (this.simTime < deadline) {
+        const toEdge = clocks.length ? timeToNextClockEdge(this.simTime, clocks) : Infinity;
+        // Sicherheitsfloor gegen eine Endlosschleife durch Gleitkomma-Rundung, falls toEdge
+        // durch Rundungsfehler auf (nahezu) 0 fällt, ohne dass sich die Phase wirklich ändert.
+        const step = Math.max(Math.min(toEdge, deadline - this.simTime), this.simStepMs);
+        this.simTime = Math.min(this.simTime + step, deadline);
         ({ wireValues, instanceOutputs } = settleCircuit(this.circuit, { now: this.simTime }));
         iters++;
+        if (iters >= this.maxSubStepsPerFrame) break;
         if ((iters & 63) === 0 && performance.now() > budgetDeadline) break;
       }
-      this._simDebtMs = Math.min(Math.max(remaining, 0), this._maxSimDebtMs);
+      this._simDebtMs = Math.min(Math.max(deadline - this.simTime, 0), this._maxSimDebtMs);
     }
 
     this.wireValues = wireValues;
@@ -1073,12 +1068,18 @@ export class Editor {
       let corners = extraPoints.map((p) => ({ ...p }));
       if (pinA.dir !== 'out') corners = corners.reverse();
 
-      // Auch ganz ohne manuell gesetzte Ecken: liegen Start und Ziel nicht auf einer
-      // gemeinsamen Achse, MUSS ein Elbow-Punkt eingefügt werden - Kabel bleiben
-      // in Ortho-Modus immer strikt horizontal/vertikal, ohne Ausnahme.
-      if (corners.length === 0 && src && tgt &&
-          Math.abs(src.x - tgt.x) > 0.01 && Math.abs(src.y - tgt.y) > 0.01) {
-        corners = [{ x: tgt.x, y: src.y, auto: true }];
+      // Liegt der letzte Punkt vor dem Ziel (Start-Pin, falls keine Ecken manuell gesetzt
+      // wurden, sonst die letzte manuell gesetzte Ecke) nicht auf einer gemeinsamen Achse
+      // mit dem Ziel-Pin, wird automatisch eine Ecke eingefügt, damit das letzte Segment
+      // immer strikt horizontal/vertikal bleibt - auch wenn vorher schon manuell Ecken
+      // gesetzt wurden (vorher wurde das nur beim direkten Pin-zu-Pin-Fall ohne jede
+      // manuelle Ecke gemacht, wodurch das allerletzte Segment nach einer manuell gesetzten
+      // Ecke schräg blieb und man es von Hand nachjustieren musste).
+      if (src && tgt) {
+        const lastBeforeTarget = corners.length ? corners[corners.length - 1] : src;
+        if (Math.abs(lastBeforeTarget.x - tgt.x) > 0.01 && Math.abs(lastBeforeTarget.y - tgt.y) > 0.01) {
+          corners = [...corners, { x: tgt.x, y: lastBeforeTarget.y, auto: true }];
+        }
       }
       points = (src && tgt) ? simplifyPoints([src, ...corners, tgt]).slice(1, -1) : corners;
     }
@@ -1408,9 +1409,20 @@ export class Editor {
     toast('Neue Schaltung angelegt', 'info');
   }
 
-  saveToFile() {
+  async saveToFile() {
+    const meta = await showDialog({
+      title: 'Schaltung speichern',
+      fields: [
+        { key: 'name', label: 'Name', type: 'text', value: this.meta.name || 'Unbenannte Schaltung' },
+        { key: 'author', label: 'Autor', type: 'text', value: this.meta.author || '' },
+        { key: 'description', label: 'Beschreibung', type: 'textarea', rows: 3, value: this.meta.description || '' },
+      ],
+      submitLabel: 'Speichern',
+    });
+    if (!meta || !meta.name.trim()) return;
+    this.meta = { ...this.meta, name: meta.name.trim(), author: meta.author.trim(), description: meta.description.trim() };
     const text = serializeCircuit(this.circuit, this.meta);
-    const filename = (this.meta.name || 'schaltung').replace(/[^\w\-]+/g, '_') + '.lgf';
+    const filename = this.meta.name.replace(/[^\w\-]+/g, '_') + '.lgf';
     downloadTextFile(filename, text);
     toast(`Gespeichert als ${filename}`, 'success');
   }
