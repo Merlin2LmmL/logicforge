@@ -57,6 +57,85 @@ registerComponentType({
   },
 });
 
+function makeReducer({ type, label, color, op, identity, helpText }) {
+  registerComponentType({
+    type,
+    category: 'Verdrahtung',
+    label,
+    color,
+    paramsSchema: [
+      { key: 'width', label: 'Busbreite', kind: 'int', min: 1, max: 32, step: 1, default: 8 },
+    ],
+    pins: (params) => [
+      { id: 'bus', label: 'BUS', dir: 'in', width: params.width ?? 8, side: 'left', order: 0 },
+      { id: 'out', label: 'Y', dir: 'out', width: 1, side: 'right', order: 0 },
+    ],
+    size: () => ({ w: 3, h: 2 }),
+    init: () => ({}),
+    evaluate: ({ inputs, params }) => {
+      const width = params.width ?? 8;
+      const bus = inputs.bus || new Array(width).fill(FLOATING);
+
+      let acc = identity;
+      let hasFloating = false;
+
+      for (let i = 0; i < width; i++) {
+        const bit = bus[i] ?? FLOATING;
+
+        if (bit === FLOATING) {
+          hasFloating = true;
+          continue;
+        }
+
+        if (bit === 'X') {
+          return { outputs: { out: ['X'] }, state: {} };
+        }
+
+        acc = op(acc, bit);
+      }
+
+      if (hasFloating) acc = FLOATING;
+
+      return { outputs: { out: [acc] }, state: {} };
+    },
+    help: {
+      summary: helpText,
+      usage: 'Reduziert alle Bits eines Busses zu einem einzelnen Bit.',
+      pins: {
+        bus: 'Eingangsbus.',
+        out: '1-Bit-Ergebnis der Reduktion.',
+      },
+    },
+  });
+}
+
+makeReducer({
+  type: 'REDUCE_OR',
+  label: 'OR-Reduktor',
+  color: '#5eb0f0',
+  op: (a, b) => a | b,
+  identity: 0,
+  helpText: 'Ausgang ist 1, sobald mindestens ein Bit des Busses 1 ist.',
+});
+
+makeReducer({
+  type: 'REDUCE_AND',
+  label: 'AND-Reduktor',
+  color: '#e8b34c',
+  op: (a, b) => a & b,
+  identity: 1,
+  helpText: 'Ausgang ist 1, wenn alle Bits des Busses 1 sind.',
+});
+
+makeReducer({
+  type: 'REDUCE_XOR',
+  label: 'XOR-Reduktor',
+  color: '#a984e8',
+  op: (a, b) => a ^ b,
+  identity: 0,
+  helpText: 'Ausgang ist 1, wenn eine ungerade Anzahl der Bus-Bits 1 ist (Parität).',
+});
+
 registerComponentType({
   type: 'TUNNEL_IN',
   category: 'Verdrahtung',
