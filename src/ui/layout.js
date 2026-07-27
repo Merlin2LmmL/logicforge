@@ -38,35 +38,46 @@ export function computeLayout(inst) {
     if (n === 0) continue;
 
     const isVertical = side === 'left' || side === 'right';
-    const span = (isVertical ? h : w) - 2; // Platz zwischen den Rand-Einheiten oben/unten bzw. links/rechts
-    const blockLen = n - 1; // Länge des Pin-Blocks bei Pitch = 1
+    const span = (isVertical ? h : w) - 2;
+    const blockLen = n - 1;
 
-    // Block zentrieren, dabei innerhalb [0, span] clampen, falls die
-    // Komponente für die Pin-Anzahl eigentlich zu klein ist.
-    const clampedBlockLen = Math.min(blockLen, Math.max(0, span));
-    let start = Math.round((span - clampedBlockLen) / 2);
-    start = Math.max(0, Math.min(start, span - clampedBlockLen));
-    start += 1; // ursprünglicher 1er-Rand
-
-    // Falls die Komponente kleiner ist als n Pins brauchen (blockLen > span),
-    // wird der Pitch reduziert, damit trotzdem alles reinpasst, ohne zu überlappen
-    // – aber wir runden erst am Ende jeder Position, nicht kumulativ.
-    const pitch = blockLen > 0 ? Math.min(1, clampedBlockLen / blockLen) : 1;
-
-    list.forEach((p, idx) => {
-      const pos = Math.round(start + idx * pitch);
-      let x, y;
-      if (isVertical) {
-        y = pos;
-        x = side === 'left' ? 0 : w;
-      } else {
-        x = pos;
-        y = side === 'top' ? 0 : h;
-      }
-      positions.set(p.id, { x, y, side });
-    });
+    if (blockLen <= span) {
+      // Normalfall: genug Platz, Pitch = 1, zentriert.
+      const start = 1 + Math.round((span - blockLen) / 2);
+      list.forEach((p, idx) => {
+        const pos = start + idx;
+        setPos(positions, p, side, pos, w, h);
+      });
+    } else {
+      // Zu wenig Platz für n Pins mit Pitch 1: garantiert trotzdem
+      // strikt aufsteigende, verschiedene Ganzzahlen (kein Overlap),
+      // auch wenn dadurch die Optik gequetscht wirkt.
+      list.forEach((p, idx) => {
+        const raw = 1 + (span * idx) / blockLen;
+        const pos = Math.min(1 + span, Math.max(1, Math.round(raw)));
+        const prev = positions.get(list[idx - 1]?.id);
+        const finalPos = prev && pos <= prev.pos ? prev.pos + 1 : pos;
+        setPos(positions, p, side, finalPos, w, h);
+        positions.get(p.id).pos = finalPos; // intern für nächsten Vergleich
+      });
+      // pos-Hilfsfeld wieder entfernen, falls ihr es nicht im Public-API wollt
+      list.forEach(p => delete positions.get(p.id).pos);
+    }
   }
   return { pins, w, h, positions, def };
+}
+
+function setPos(positions, p, side, pos, w, h) {
+  const isVertical = side === 'left' || side === 'right';
+  let x, y;
+  if (isVertical) {
+    y = pos;
+    x = side === 'left' ? 0 : w;
+  } else {
+    x = pos;
+    y = side === 'top' ? 0 : h;
+  }
+  positions.set(p.id, { x, y, side, pos });
 }
 
 export function pinWorldPos(inst, pinId) {
