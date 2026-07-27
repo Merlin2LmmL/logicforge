@@ -748,18 +748,30 @@ function drawTunnel(ctx, pw, ph, inst, type) {
   ctx.fillText(inst.params?.net || '', 0, ph / 2 + 10);
 }
 
-function drawSplitMerge(ctx, pw, ph, inst) {
+function drawSplitMerge(ctx, pw, ph, inst, type) {
   boxRect(ctx, pw, ph, COLORS.compFill, '#6f7d8c', false);
-  ctx.strokeStyle = '#6f7d8c';
-  ctx.lineWidth = 1;
   const n = inst.params?.width ?? 8;
+  const leftX = -pw / 2;
+  const rightX = pw / 2;
+  const busX = type === 'SPLITTER'
+    ? leftX + 6
+    : rightX - 6;
+  ctx.save();
+  ctx.strokeStyle = '#6f7d8c';
+  ctx.lineWidth = 1.2;
   for (let i = 0; i < n; i++) {
-    const y = -ph / 2 + ((i + 1) / (n + 1)) * ph;
+    const y = Math.round(-ph / 2 + ((i + 1) * ph) / (n + 1));
     ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(pw / 2 - 4, 0);
+    if (type === 'SPLITTER') {
+      ctx.moveTo(busX, 0);
+      ctx.lineTo(rightX - 1, y);
+    } else {
+      ctx.moveTo(leftX + 1, y);
+      ctx.lineTo(busX, 0);
+    }
     ctx.stroke();
   }
+  ctx.restore();
 }
 
 function drawAddSub(ctx, pw, ph, inst, opts, def) {
