@@ -15,6 +15,31 @@ export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 
   let stable = false;
   let prevSnapshot = null;
 
+  // Snapshot of every component's state as it was BEFORE this settle() call, passed to
+  // evaluate() alongside the (per-iteration, live-mutating) `state`. Edge-triggered
+  // components (DFF/Register/RAM/Counter/...) must compare their clock edge against THIS
+  // frozen value, not against `state.prevClk`, which changes on every iteration below.
+  //
+  // Reason: this loop calls evaluate() on every component once per iteration, in array
+  // order, and commits `inst.state` immediately - it does not wait for the whole circuit to
+  // settle first. If an edge-triggered component's clk input resolves to its new value in
+  // iteration N (because its driving component happens to run earlier in `circuit.components`
+  // this iteration), it would - if compared against its own live `state.prevClk` - detect and
+  // "consume" the rising edge in that same iteration N, even though other inputs (e.g. D
+  // coming from an ENCODER/MUX that hasn't been evaluated yet this iteration) haven't
+  // propagated through `wireValues` yet. The edge is then gone for the rest of this call, and
+  // the component silently latches a stale/floating value - it never gets a second chance,
+  // even though later iterations would have produced the correct, fully-settled D.
+  //
+  // By comparing against callStartState.prevClk (fixed for the whole call) instead, a
+  // component keeps re-latching on every iteration for as long as the clock genuinely
+  // transitioned since the last settle() call - always using the most current (best
+  // available) data inputs - so by the time wireValues actually stabilizes (or maxIters is
+  // reached), the last iteration's result reflects the fully-settled inputs. Only that final
+  // result gets committed as the new `state.prevClk`, so the NEXT call correctly sees the
+  // edge as consumed.
+  const callStartState = new Map(circuit.components.map((inst) => [inst.id, inst.state]));
+
   for (let iter = 0; iter < maxIters; iter++) {
     // 1) regular components
     for (const inst of circuit.components) {
@@ -30,7 +55,14 @@ export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 
       const injected = def.isInterface === 'in' && Object.prototype.hasOwnProperty.call(forcedInputs, inst.id)
         ? forcedInputs[inst.id]
         : undefined;
-      const result = def.evaluate({ inputs, state: inst.state, params: inst.params || {}, now, injected });
+      const result = def.evaluate({
+        inputs,
+        state: inst.state,
+        params: inst.params || {},
+        now,
+        injected,
+        callStartState: callStartState.get(inst.id),
+      });
       inst.state = result.state ?? inst.state;
       instanceOutputs.set(inst.id, result.outputs || {});
       for (const p of pins) {
