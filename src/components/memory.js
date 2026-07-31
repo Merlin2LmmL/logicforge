@@ -26,7 +26,7 @@ registerComponentType({
   // sich in synchronen Schaltungen genauso verhält wie DFF/Register. S=R=1 ist der
   // klassische verbotene Zustand eines SR-Speichers und wird als Konflikt ausgegeben,
   // statt stillschweigend einen der beiden Fälle zu bevorzugen.
-  evaluate: ({ inputs, state }) => {
+  evaluate: ({ inputs, state, callStartState }) => {
     const s = bit1(inputs.s?.[0]);
     const r = bit1(inputs.r?.[0]);
     const clk = ctrl(inputs.clk?.[0], 0);
@@ -37,7 +37,12 @@ registerComponentType({
     if (rst === 1) {
       q = 0;
     } else if (en === 1) {
-      const rising = state.prevClk === 0 && clk === 1;
+      // Compare against the state from BEFORE this settle() call (frozen for the whole
+      // call), not state.prevClk (which is updated every settle iteration). Otherwise a
+      // rising edge can be "consumed" in an early iteration before inputs coming from
+      // multi-stage combinational logic (e.g. an ENCODER/MUX) have finished propagating,
+      // silently latching a stale/floating value. See simulator.js for details.
+      const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
       if (rising) {
         const sv = s === 1, rv = r === 1;
         if (sv && rv) conflict = true;
@@ -75,7 +80,7 @@ registerComponentType({
   init: () => ({ q: 0, prevClk: 0 }),
   // J=K=1 toggelt (der Fall, der beim SR-Flipflop verboten ist) - das ist der ganze
   // Sinn des JK-Typs, deshalb hier kein Konfliktpfad nötig.
-  evaluate: ({ inputs, state }) => {
+  evaluate: ({ inputs, state, callStartState }) => {
     const j = bit1(inputs.j?.[0]);
     const k = bit1(inputs.k?.[0]);
     const clk = ctrl(inputs.clk?.[0], 0);
@@ -85,7 +90,9 @@ registerComponentType({
     if (rst === 1) {
       q = 0;
     } else if (en === 1) {
-      const rising = state.prevClk === 0 && clk === 1;
+      // See SRFF above: compare against the pre-call snapshot, not the live per-iteration
+      // state, so a rising edge isn't consumed before slower combinational inputs settle.
+      const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
       if (rising) {
         const jv = j === 1, kv = k === 1;
         if (jv && kv) q = q ? 0 : 1;
@@ -118,7 +125,7 @@ registerComponentType({
   ],
   size: () => ({ w: 3, h: 4 }),
   init: () => ({ q: 0, prevClk: 0 }),
-  evaluate: ({ inputs, state }) => {
+  evaluate: ({ inputs, state, callStartState }) => {
     const d = bit1(inputs.d?.[0]);
     const clk = ctrl(inputs.clk?.[0], 0);
     const en = ctrl(inputs.en?.[0], 1);
@@ -127,7 +134,9 @@ registerComponentType({
     if (rst === 1) {
       q = 0;
     } else if (en === 1) {
-      const rising = state.prevClk === 0 && clk === 1;
+      // See SRFF above: compare against the pre-call snapshot, not the live per-iteration
+      // state, so a rising edge isn't consumed before slower combinational inputs settle.
+      const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
       if (rising && (d === 0 || d === 1)) q = d;
     }
     return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, prevClk: clk } };
@@ -154,13 +163,19 @@ registerComponentType({
   ],
   size: (params) => ({ w: 4, h: Math.max(4, Math.ceil((params.width ?? 8) / 4) + 2) }),
   init: (params) => ({ value: 0, prevClk: 0, width: params.width ?? 8 }),
-  evaluate: ({ inputs, state, params }) => {
+  evaluate: ({ inputs, state, params, callStartState }) => {
     const width = params.width ?? 8;
     const clk = ctrl(inputs.clk?.[0], 0);
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let value = state.value ?? 0;
-    const rising = state.prevClk === 0 && clk === 1;
+    // Compare against the state from BEFORE this settle() call (frozen for the whole call),
+    // not state.prevClk (which updates every settle iteration). Otherwise a rising edge can
+    // get "consumed" in an early iteration before D has finished propagating through
+    // multi-stage combinational logic (e.g. an ENCODER or MUX driving D) - the register then
+    // silently latches a stale/floating value and never gets a second chance within this
+    // call. See simulator.js for the full explanation.
+    const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
     if (rst === 1) {
       value = 0;
     } else if (en === 1 && rising) {
@@ -204,7 +219,7 @@ registerComponentType({
   // beide unbeschaltet -> Baustein aktiv (Rückwärtskompatibilität mit bestehenden
   // Schaltungen ohne diese Pins). Ist einer der beiden 0, tristated der Ausgang und
   // Schreibzugriffe werden ignoriert, so wie beim echten Chip.
-  evaluate: ({ inputs, state, params }) => {
+  evaluate: ({ inputs, state, params, callStartState }) => {
     const addrWidth = Math.min(params.addrWidth ?? 4, MAX_ADDR_BITS);
     const dataWidth = params.dataWidth ?? 8;
     const size = 2 ** addrWidth;
@@ -217,7 +232,10 @@ registerComponentType({
     const ce = ctrl(inputs.ce?.[0], 1);
     const cs = ctrl(inputs.cs?.[0], 1);
     const enabled = ce === 1 && cs === 1;
-    const rising = state.prevClk === 0 && clk === 1;
+    // See REGISTER above: compare against the pre-call snapshot, not the live
+    // per-iteration state, so a rising edge isn't consumed before DIN/ADDR (which may come
+    // from multi-stage combinational logic) have finished propagating this call.
+    const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
     if (we === 1 && rising && enabled) {
       const dinBits = inputs.din || new Array(dataWidth).fill(FLOATING);
       const v = toInt(dinBits);
@@ -370,7 +388,7 @@ registerComponentType({
   init: () => ({ value: 0, prevClk: 0 }),
   // TC (Terminal Count) geht auf 1, sobald der Zähler seinen Endwert erreicht -
   // nützlich zum Kaskadieren mehrerer Zähler zu breiteren Zählketten.
-  evaluate: ({ inputs, state, params }) => {
+  evaluate: ({ inputs, state, params, callStartState }) => {
     const width = params.width ?? 8;
     const max = 2 ** width;
     const clk = ctrl(inputs.clk?.[0], 0);
@@ -378,7 +396,10 @@ registerComponentType({
     const rst = ctrl(inputs.rst?.[0], 0);
     const dir = ctrl(inputs.dir?.[0], 1); // 1 = hoch (Standard), 0 = runter
     let value = state.value ?? 0;
-    const rising = state.prevClk === 0 && clk === 1;
+    // See REGISTER above: compare against the pre-call snapshot, not the live
+    // per-iteration state, so a rising edge isn't consumed before DIR (or any input coming
+    // from combinational logic) has finished propagating this call.
+    const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
     if (rst === 1) {
       value = 0;
     } else if (en === 1 && rising) {
@@ -415,7 +436,7 @@ registerComponentType({
   ],
   size: () => ({ w: 4, h: 6 }),
   init: () => ({ value: 0, prevClk: 0 }),
-  evaluate: ({ inputs, state, params }) => {
+  evaluate: ({ inputs, state, params, callStartState }) => {
     const width = params.width ?? 8;
     const dir = params.direction ?? 'left';
     const clk = ctrl(inputs.clk?.[0], 0);
@@ -425,7 +446,10 @@ registerComponentType({
     const sin = ctrl(inputs.sin?.[0], 0);
     let value = state.value ?? 0;
     let soutBit = dir === 'left' ? (value >> (width - 1)) & 1 : value & 1;
-    const rising = state.prevClk === 0 && clk === 1;
+    // See REGISTER above: compare against the pre-call snapshot, not the live
+    // per-iteration state, so a rising edge isn't consumed before D (which may come from
+    // multi-stage combinational logic) has finished propagating this call.
+    const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
     const mask = width >= 31 ? 0xFFFFFFFF : (2 ** width - 1);
     if (rst === 1) {
       value = 0;
