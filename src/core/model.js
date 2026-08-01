@@ -70,8 +70,25 @@ export class Wire {
 // define the component's external interface).
 export class Circuit {
   constructor({ components = [], wires = [] } = {}) {
-    this.components = components; // ComponentInstance[]
-    this.wires = wires;           // Wire[]
+    this.components = components;
+    this.wires = wires;
+    this._wireIntoIndex = new Map();
+    this._wiresFromIndex = new Map();
+    this._indexedWiresRef = null;
+  }
+
+  _ensureWireIndex() {
+    if (this._indexedWiresRef === this.wires) return;
+    this._wireIntoIndex.clear();
+    this._wiresFromIndex.clear();
+    for (const w of this.wires) {
+      this._wireIntoIndex.set(w.to.compId + ':' + w.to.pinId, w);
+      const key = w.from.compId + ':' + w.from.pinId;
+      let arr = this._wiresFromIndex.get(key);
+      if (!arr) { arr = []; this._wiresFromIndex.set(key, arr); }
+      arr.push(w);
+    }
+    this._indexedWiresRef = this.wires;
   }
 
   addComponent(inst) { this.components.push(inst); return inst; }
@@ -81,12 +98,17 @@ export class Circuit {
   }
   getComponent(id) { return this.components.find((c) => c.id === id); }
 
-  addWire(w) { this.wires.push(w); return w; }
+  addWire(w) { this.wires = [...this.wires, w]; return w; }
   removeWire(id) { this.wires = this.wires.filter((w) => w.id !== id); }
 
-  // An input pin may only have a single driving wire.
-  wireInto(compId, pinId) { return this.wires.find((w) => w.to.compId === compId && w.to.pinId === pinId); }
-  wiresFrom(compId, pinId) { return this.wires.filter((w) => w.from.compId === compId && w.from.pinId === pinId); }
+  wireInto(compId, pinId) {
+    this._ensureWireIndex();
+    return this._wireIntoIndex.get(compId + ':' + pinId);
+  }
+  wiresFrom(compId, pinId) {
+    this._ensureWireIndex();
+    return this._wiresFromIndex.get(compId + ':' + pinId) || [];
+  }
 
   clone() {
     return new Circuit({
