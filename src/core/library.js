@@ -42,6 +42,15 @@ function compositeBoxSize(pins) {
   return { w: 5, h: Math.max(3, Math.max(nIn, nOut) + 1) };
 }
 
+function pinInputsKey(def, forcedInputs) {
+  let s = '';
+  for (const p of def.pins) {
+    if (p.dir !== 'in') continue;
+    s += p.id + '=' + forcedInputs[p.id].join(',') + ';';
+  }
+  return s;
+}
+
 function buildCompositeType(def) {
   return {
     type: def.id,
@@ -58,10 +67,24 @@ function buildCompositeType(def) {
       if (!sub || !(sub instanceof Circuit)) {
         sub = Circuit.fromPlain(sub && sub.components ? sub : def.circuit);
       }
+      if (sub._lfHasActiveClock === undefined) {
+        sub._lfHasActiveClock = sub.components.some((inst) => {
+          const d = getComponentType(inst.type);
+          return d?.isClock && (inst.params?.hz ?? 0) > 0;
+        });
+      }
+
       const forcedInputs = {};
       for (const p of def.pins) {
         if (p.dir === 'in') forcedInputs[p.id] = inputs[p.id] || makeFloating(p.width);
       }
+
+      const key = pinInputsKey(def, forcedInputs);
+      const canMemoize = !sub._lfHasActiveClock;
+      if (canMemoize && sub._lfLastKey === key && sub._lfLastOutputs) {
+        return { outputs: sub._lfLastOutputs, state: { sub } };
+      }
+
       settleCircuit(sub, { forcedInputs, now });
       const outputs = {};
       for (const p of def.pins) {
@@ -69,6 +92,7 @@ function buildCompositeType(def) {
         const inst = sub.getComponent(p.id);
         outputs[p.id] = (inst && inst.state && inst.state.last) || makeFloating(p.width);
       }
+      if (canMemoize) { sub._lfLastKey = key; sub._lfLastOutputs = outputs; }
       return { outputs, state: { sub } };
     },
   };
