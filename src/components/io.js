@@ -113,85 +113,53 @@ registerComponentType({
   category: 'Ein-/Ausgabe',
   label: 'Impuls-Takt',
   color: '#e0e6ec',
-
   isClock: true,
-
   paramsSchema: [
-    {
-      key: 'hz',
-      label: 'Frequenz (Hz), 0 = manuell',
-      kind: 'int',
-      min: 0,
-      max: 1_000_000,
-      step: 1,
-      default: 0,
-    },
+    { key: 'hz', label: 'Frequenz (Hz), 0 = manuell', kind: 'int', min: 0, max: 1_000_000, step: 1, default: 0 },
   ],
-
   pins: () => [{ id: 'out', label: '', dir: 'out', width: 1, side: 'right', order: 0 }],
   size: () => ({ w: 2, h: 2 }),
-
-  init: () => ({
-    armed: false,
-    fired: false,
-    cycleStart: 0,
-  }),
-
+  init: () => ({ armed: false, _callRef: null, _pulsedThisArm: false }),
   interactive: true,
-
   onActivate: (state, params) => {
     if ((params?.hz ?? 0) > 0) return state;
-    return state.armed ? state : { ...state, armed: true, fired: false };
+    return state.armed ? state : { ...state, armed: true, _pulsedThisArm: false };
   },
-
-  evaluate: ({ state, params, now }) => {
+  evaluate: ({ state, params, now, callStartState }) => {
     const hz = params.hz ?? 0;
 
-    // Manual mode
     if (hz <= 0) {
-      if (state.armed && !state.fired) {
-        return {
-          outputs: { out: [1] },
-          state: { ...state, armed: false, fired: true },
-        };
-      }
+      if (!state.armed) return { outputs: { out: [0] }, state };
 
-      return {
-        outputs: { out: [0] },
-        state,
-      };
+      // Hält den Ausgang für JEDE Iteration des GESAMTEN settleCircuit()-Aufrufs auf 1
+      // (callStartState ist über den ganzen Aufruf hinweg konstant) - unabhängig davon,
+      // ob diese Komponente vor oder nach dem CLK-Verbraucher im components-Array steht.
+      // Erst der NÄCHSTE Aufruf (neue callStartState-Referenz) schaltet ab, nachdem der
+      // Impuls einmal vollständig "gesehen" wurde.
+      const isNewCall = state._callRef !== callStartState;
+      if (isNewCall && state._pulsedThisArm) {
+        return { outputs: { out: [0] }, state: { armed: false, _callRef: callStartState, _pulsedThisArm: false } };
+      }
+      return { outputs: { out: [1] }, state: { armed: true, _callRef: callStartState, _pulsedThisArm: true } };
     }
 
-    // Automatic mode
+    // Automatischer Modus: `now` ist über den gesamten Aufruf konstant, daher betrifft
+    // dieses Problem hier nicht - `elapsed === 0` ist entweder in JEDER Iteration wahr
+    // oder in keiner.
     const period = 1000 / hz;
-
     let cycleStart = state.cycleStart || 0;
     let elapsed = now - cycleStart;
-
     if (elapsed < 0 || elapsed >= period) {
       cycleStart = now - (((elapsed % period) + period) % period);
       elapsed = now - cycleStart;
     }
-
     const pulse = elapsed === 0;
-
-    return {
-      outputs: { out: [pulse ? 1 : 0] },
-      state: {
-        ...state,
-        cycleStart,
-      },
-    };
+    return { outputs: { out: [pulse ? 1 : 0] }, state: { ...state, cycleStart } };
   },
-
   help: {
-    summary:
-      'Einzelimpuls-Takt: bei Frequenz 0 manuell, bei Frequenz >0 genau ein Impuls pro Periode.',
-    usage:
-      'Mit Frequenz 0 erzeugt jeder Klick genau einen Impuls. Mit Frequenz >0 wird automatisch einmal pro Periode ein einzelner Impuls erzeugt.',
-    pins: {
-      out: 'Einzelimpuls.',
-    },
+    summary: 'Einzelimpuls-Takt: bei Frequenz 0 manuell, bei Frequenz >0 genau ein Impuls pro Periode. Der Impuls bleibt für einen vollständigen Simulationsschritt aktiv, damit er unabhängig von der Bauteilreihenfolge zuverlässig erkannt wird.',
+    usage: 'Mit Frequenz 0 erzeugt jeder Klick genau einen Impuls. Mit Frequenz >0 wird automatisch einmal pro Periode ein einzelner Impuls erzeugt.',
+    pins: { out: 'Einzelimpuls.' },
   },
 });
 
