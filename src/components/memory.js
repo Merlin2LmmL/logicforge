@@ -15,26 +15,30 @@ function ctrl(v, fallback) { return v === 1 || v === 0 ? v : fallback; }
 // whether we're still inside the same call (further clk=1 iterations are the same
 // edge, already consumed) or a new call has started (a fresh edge is possible again).
 //
-// IMPORTANT - "hold open" for not-yet-settled data:
+// IMPORTANT - "hold open" for not-yet-settled inputs:
 // settleCircuit() runs the full component list once per iteration, in plain array
 // order (not topologically sorted - see simulator.js). That means on the very first
-// iteration where this component's clk input happens to already read 1, an upstream
-// component that drives this component's *data* input (d / din / bus, ...) may not
-// have run yet this pass, so that data input can still read as fully floating even
-// though the circuit as a whole will converge to a valid, stable value a few
-// iterations later within the same settleCircuit() call.
+// iteration where this component's clk input happens to already read 1, any other
+// input this component's write depends on - the data bus (d / din / ...) OR a gating
+// signal like EN when it's driven through upstream logic rather than a plain floating
+// wire - may not have reached its converged value yet this pass. A gate driving EN
+// can transiently compute 0 before settling to 1, for example.
 //
 // Since a rising edge is normally a one-shot per call (_edgeConsumed latches true
-// forever once fired), sampling on that too-early iteration would permanently burn
-// the edge with a floating/garbage sample and never get a second chance to read the
-// real value later in the same call - even though clk never actually toggled again.
+// forever once fired), detecting `rising` on that too-early iteration and then
+// discovering EN (or the data) wasn't actually ready yet would permanently burn the
+// edge and never get a second chance later in the same call - even though clk never
+// toggled again and the circuit does converge to valid values a few iterations later.
 //
-// To fix this, callers that sample a data bus on the edge should call
-// consumeRisingEdge(), and IF `rising` was true but the sampled data turned out to be
-// floating/unresolved, call holdEdgeOpen(meta) before returning it as `state`. That
-// clears _edgeConsumed (but leaves prevClk updated to reflect clk's current value),
-// so a later iteration in the same settleCircuit() call - once upstream logic has
-// settled - is allowed to detect the rising edge again and sample correctly.
+// To fix this, every call site that gates a write on `en === 1 && rising` (or samples
+// a data bus on the edge) must call holdEdgeOpen(meta) whenever `rising` was true but
+// the write did NOT happen this iteration for a reason that might just be "not
+// settled yet" (en read 0, or the sampled data was floating) - as opposed to a reason
+// that's a real, final decision for this call (rst===1, which is unconditional and
+// correctly-final regardless of iteration). holdEdgeOpen() clears _edgeConsumed (but
+// leaves prevClk updated to reflect clk's current value), so a later iteration in the
+// same settleCircuit() call - once upstream logic has settled - is allowed to detect
+// the rising edge again and retry the write with resolved inputs.
 function consumeRisingEdge(state, callStartState, clk, callId) {
   const isNewCall = state._callId !== callId;
   const alreadyConsumed = !isNewCall && !!state._edgeConsumed;
@@ -46,10 +50,11 @@ function consumeRisingEdge(state, callStartState, clk, callId) {
   };
 }
 
-// Call when `rising` was true but the value sampled on this edge was still floating
-// (data source not yet evaluated this pass) - keeps the edge available so a later
-// iteration within the same settleCircuit() call can sample the settled value instead
-// of permanently losing the write.
+// Call when `rising` was true this iteration but the write was skipped for a reason
+// that might only be "this pass hasn't converged yet" (en not yet 1, or the sampled
+// data bus was still floating) - keeps the edge available so a later iteration within
+// the same settleCircuit() call can retry once upstream logic has settled, instead of
+// permanently losing the write.
 function holdEdgeOpen(meta) {
   meta._edgeConsumed = false;
 }
@@ -82,9 +87,11 @@ registerComponentType({
     const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (rst === 1) {
       q = 0;
-    } else if (en === 1 && rising) {
-      if (s === FLOATING || r === FLOATING) {
-        holdEdgeOpen(meta); // s/r not settled yet this pass - try again next iteration
+    } else if (rising) {
+      if (en !== 1 || s === FLOATING || r === FLOATING) {
+        // en not yet resolved to 1, or s/r not settled yet this pass - try again
+        // next iteration instead of permanently losing this edge.
+        holdEdgeOpen(meta);
       } else {
         const sv = s === 1, rv = r === 1;
         if (sv && rv) conflict = true;
