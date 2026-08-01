@@ -14,14 +14,14 @@ function ctrl(v, fallback) { return v === 1 || v === 0 ? v : fallback; }
 // callStartState.prevClk (frozen for the whole call) lets every iteration where clk
 // happens to resolve to 1 re-trigger the edge - which is exactly what caused counters
 // fed back into their own D input to run away instead of stepping by exactly 1.
-function consumeRisingEdge(state, callStartState, clk) {
-  const isNewCall = state._callRef !== callStartState;
+function consumeRisingEdge(state, callStartState, clk, callId) {
+  const isNewCall = state._callId !== callId;
   const alreadyConsumed = !isNewCall && !!state._edgeConsumed;
   const baselineLow = (callStartState ?? state).prevClk === 0;
   const rising = !alreadyConsumed && baselineLow && clk === 1;
   return {
     rising,
-    meta: { _callRef: callStartState, _edgeConsumed: alreadyConsumed || rising, prevClk: clk },
+    meta: { _callId: callId, _edgeConsumed: alreadyConsumed || rising, prevClk: clk },
   };
 }
 
