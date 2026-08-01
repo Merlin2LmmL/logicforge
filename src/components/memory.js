@@ -169,13 +169,13 @@ registerComponentType({
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let value = state.value ?? 0;
-    // Compare against the state from BEFORE this settle() call (frozen for the whole call),
-    // not state.prevClk (which updates every settle iteration). Otherwise a rising edge can
-    // get "consumed" in an early iteration before D has finished propagating through
-    // multi-stage combinational logic (e.g. an ENCODER or MUX driving D) - the register then
-    // silently latches a stale/floating value and never gets a second chance within this
-    // call. See simulator.js for the full explanation.
     const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
+    console.log('[REGISTER]', {
+      clk, en, rst, rising,
+      callStartPrevClk: callStartState?.prevClk,
+      d: inputs.d,
+      currentValue: value,
+    });
     if (rst === 1) {
       value = 0;
     } else if (en === 1 && rising) {
