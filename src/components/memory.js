@@ -14,6 +14,27 @@ function ctrl(v, fallback) { return v === 1 || v === 0 ? v : fallback; }
 // object reference, which can be ambiguous across sub-stepped/cloned state) tells us
 // whether we're still inside the same call (further clk=1 iterations are the same
 // edge, already consumed) or a new call has started (a fresh edge is possible again).
+//
+// IMPORTANT - "hold open" for not-yet-settled data:
+// settleCircuit() runs the full component list once per iteration, in plain array
+// order (not topologically sorted - see simulator.js). That means on the very first
+// iteration where this component's clk input happens to already read 1, an upstream
+// component that drives this component's *data* input (d / din / bus, ...) may not
+// have run yet this pass, so that data input can still read as fully floating even
+// though the circuit as a whole will converge to a valid, stable value a few
+// iterations later within the same settleCircuit() call.
+//
+// Since a rising edge is normally a one-shot per call (_edgeConsumed latches true
+// forever once fired), sampling on that too-early iteration would permanently burn
+// the edge with a floating/garbage sample and never get a second chance to read the
+// real value later in the same call - even though clk never actually toggled again.
+//
+// To fix this, callers that sample a data bus on the edge should call
+// consumeRisingEdge(), and IF `rising` was true but the sampled data turned out to be
+// floating/unresolved, call holdEdgeOpen(meta) before returning it as `state`. That
+// clears _edgeConsumed (but leaves prevClk updated to reflect clk's current value),
+// so a later iteration in the same settleCircuit() call - once upstream logic has
+// settled - is allowed to detect the rising edge again and sample correctly.
 function consumeRisingEdge(state, callStartState, clk, callId) {
   const isNewCall = state._callId !== callId;
   const alreadyConsumed = !isNewCall && !!state._edgeConsumed;
@@ -23,6 +44,14 @@ function consumeRisingEdge(state, callStartState, clk, callId) {
     rising,
     meta: { _callId: callId, _edgeConsumed: alreadyConsumed || rising, prevClk: clk },
   };
+}
+
+// Call when `rising` was true but the value sampled on this edge was still floating
+// (data source not yet evaluated this pass) - keeps the edge available so a later
+// iteration within the same settleCircuit() call can sample the settled value instead
+// of permanently losing the write.
+function holdEdgeOpen(meta) {
+  meta._edgeConsumed = false;
 }
 
 registerComponentType({
@@ -54,10 +83,14 @@ registerComponentType({
     if (rst === 1) {
       q = 0;
     } else if (en === 1 && rising) {
-      const sv = s === 1, rv = r === 1;
-      if (sv && rv) conflict = true;
-      else if (sv) q = 1;
-      else if (rv) q = 0;
+      if (s === FLOATING || r === FLOATING) {
+        holdEdgeOpen(meta); // s/r not settled yet this pass - try again next iteration
+      } else {
+        const sv = s === 1, rv = r === 1;
+        if (sv && rv) conflict = true;
+        else if (sv) q = 1;
+        else if (rv) q = 0;
+      }
     }
     const qOut = conflict ? CONFLICT : q;
     const nqOut = conflict ? CONFLICT : (q ? 0 : 1);
@@ -98,10 +131,14 @@ registerComponentType({
     if (rst === 1) {
       q = 0;
     } else if (en === 1 && rising) {
-      const jv = j === 1, kv = k === 1;
-      if (jv && kv) q = q ? 0 : 1;
-      else if (jv) q = 1;
-      else if (kv) q = 0;
+      if (j === FLOATING || k === FLOATING) {
+        holdEdgeOpen(meta); // j/k not settled yet this pass - try again next iteration
+      } else {
+        const jv = j === 1, kv = k === 1;
+        if (jv && kv) q = q ? 0 : 1;
+        else if (jv) q = 1;
+        else if (kv) q = 0;
+      }
     }
     return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, ...meta } };
   },
@@ -137,8 +174,12 @@ registerComponentType({
     const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (rst === 1) {
       q = 0;
-    } else if (en === 1 && rising && (d === 0 || d === 1)) {
-      q = d;
+    } else if (en === 1 && rising) {
+      if (d === 0 || d === 1) {
+        q = d;
+      } else {
+        holdEdgeOpen(meta); // d not settled yet this pass - try again next iteration
+      }
     }
     return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, ...meta } };
   },
@@ -178,7 +219,14 @@ registerComponentType({
     } else if (en === 1 && rising) {
       const dBits = inputs.d || new Array(width).fill(FLOATING);
       const v = toInt(dBits);
-      if (v !== null) value = v;
+      if (v !== null) {
+        value = v;
+      } else {
+        // d hasn't settled yet this pass (e.g. its source component runs later in
+        // this settleCircuit() call) - don't burn the edge, try again next iteration
+        // once d has a real value.
+        holdEdgeOpen(meta);
+      }
     }
 
     return {
@@ -236,6 +284,10 @@ registerComponentType({
       if (v !== null) {
         mem = mem.slice();
         mem[addr % size] = v;
+      } else {
+        // din (or addr) not settled yet this pass - try again next iteration
+        // instead of permanently losing this write.
+        holdEdgeOpen(meta);
       }
     }
     const out = mem[addr % size] ?? 0;
@@ -420,7 +472,13 @@ registerComponentType({
       if (ld === 1) {
         const dBits = inputs.d || new Array(width).fill(FLOATING);
         const v = toInt(dBits);
-        if (v !== null) value = v;
+        if (v !== null) {
+          value = v;
+        } else {
+          // d not settled yet this pass - try again next iteration instead of
+          // permanently losing this load.
+          holdEdgeOpen(meta);
+        }
       } else if (dir === 'left') {
         soutBit = (value >> (width - 1)) & 1;
         value = ((value << 1) | (sin ? 1 : 0)) & mask;
