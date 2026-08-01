@@ -111,36 +111,35 @@ registerComponentType({
   ],
   size: () => ({ w: 3, h: 2 }),
   init: () => ({ queue: [] }),
-  evaluate: ({ inputs, params, state }) => {
-    const width = params.width ?? 1;
-    const delayMs = params.delayMs ?? 0;
-    const a = inputs.in0 || new Array(width).fill(FLOATING);
+  evaluate: ({ inputs, params, state, now }) => {
+  const width = params.width ?? 1;
+  const delayMs = params.delayMs ?? 0;
+  const a = inputs.in0 || new Array(width).fill(FLOATING);
 
-    if (delayMs <= 0) {
-      return { outputs: { out: a.slice() }, state: { queue: [] } };
-    }
+  if (delayMs <= 0) {
+    return { outputs: { out: a.slice() }, state: { queue: [] } };
+  }
 
-    const now = Date.now();
-    const queue = (state?.queue || []).slice();
-    queue.push({ t: now, value: a.slice() });
+  const queue = state?.queue || [];
+  const last = queue[queue.length - 1];
+  // Only append when the value differs from what's already queued, or the queue
+  // is empty. Prevents growing by up to maxIters entries within a single
+  // settleCircuit() call, where `now` is constant across all iterations.
+  const newQueue = (!last || !equalBits(last.value, a))
+    ? queue.concat([{ t: now, value: a.slice() }])
+    : queue;
 
-    // Neuesten Eintrag suchen, der mindestens delayMs alt ist
-    let outValue = new Array(width).fill(FLOATING); // solange Puffer noch nicht "voll" ist
-    let cutoffIndex = -1;
-    for (let i = 0; i < queue.length; i++) {
-      if (queue[i].t <= now - delayMs) {
-        outValue = queue[i].value;
-        cutoffIndex = i;
-      } else {
-        break;
-      }
-    }
-
-    // alles vor dem zuletzt benutzten Eintrag verwerfen, den Rest behalten
-    const trimmed = cutoffIndex > 0 ? queue.slice(cutoffIndex) : queue;
-
-    return { outputs: { out: outValue.slice() }, state: { queue: trimmed } };
-  },
+  let outValue = new Array(width).fill(FLOATING);
+  let cutoffIndex = -1;
+  for (let i = 0; i < newQueue.length; i++) {
+    if (newQueue[i].t <= now - delayMs) {
+      outValue = newQueue[i].value;
+      cutoffIndex = i;
+    } else break;
+  }
+  const trimmed = cutoffIndex > 0 ? newQueue.slice(cutoffIndex) : newQueue;
+  return { outputs: { out: outValue.slice() }, state: { queue: trimmed } };
+},
   help: {
     summary: 'Signalpuffer: gibt den Eingang unverändert weiter, optional zeitlich verzögert.',
     usage: 'Nützlich, um Signale sauber umzuleiten/aufzuteilen, als Platzhalter für spätere Logik, oder um eine reale Signallaufzeit (ms) zu simulieren.',
