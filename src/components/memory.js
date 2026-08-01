@@ -15,30 +15,33 @@ function ctrl(v, fallback) { return v === 1 || v === 0 ? v : fallback; }
 // whether we're still inside the same call (further clk=1 iterations are the same
 // edge, already consumed) or a new call has started (a fresh edge is possible again).
 //
-// IMPORTANT - "hold open" for not-yet-settled inputs:
+// IMPORTANT - "hold open" for not-yet-settled gating/data:
 // settleCircuit() runs the full component list once per iteration, in plain array
 // order (not topologically sorted - see simulator.js). That means on the very first
-// iteration where this component's clk input happens to already read 1, any other
-// input this component's write depends on - the data bus (d / din / ...) OR a gating
-// signal like EN when it's driven through upstream logic rather than a plain floating
-// wire - may not have reached its converged value yet this pass. A gate driving EN
-// can transiently compute 0 before settling to 1, for example.
+// iteration where this component's clk input happens to already read 1, an upstream
+// component that drives this component's *data* input (d / din / bus, ...) - or its
+// *enable* input (en / we) - may not have run yet this pass, so those inputs can
+// still read as floating, or even as a stale resolved 0, even though the circuit as
+// a whole will converge to the real, stable values a few iterations later within the
+// same settleCircuit() call.
 //
 // Since a rising edge is normally a one-shot per call (_edgeConsumed latches true
-// forever once fired), detecting `rising` on that too-early iteration and then
-// discovering EN (or the data) wasn't actually ready yet would permanently burn the
-// edge and never get a second chance later in the same call - even though clk never
-// toggled again and the circuit does converge to valid values a few iterations later.
+// forever once fired), sampling - or gating - on that too-early iteration would
+// permanently burn the edge with a floating/stale sample and never get a second
+// chance to read the real value later in the same call - even though clk never
+// actually toggled again.
 //
-// To fix this, every call site that gates a write on `en === 1 && rising` (or samples
-// a data bus on the edge) must call holdEdgeOpen(meta) whenever `rising` was true but
-// the write did NOT happen this iteration for a reason that might just be "not
-// settled yet" (en read 0, or the sampled data was floating) - as opposed to a reason
-// that's a real, final decision for this call (rst===1, which is unconditional and
-// correctly-final regardless of iteration). holdEdgeOpen() clears _edgeConsumed (but
-// leaves prevClk updated to reflect clk's current value), so a later iteration in the
-// same settleCircuit() call - once upstream logic has settled - is allowed to detect
-// the rising edge again and retry the write with resolved inputs.
+// To fix this, every call site must treat `rising` as provisional: only leave
+// _edgeConsumed=true (i.e. actually let the edge "count") on the iteration where the
+// write genuinely happens. On every other iteration where `rising` was true but the
+// gating (en/we) hasn't resolved to 1 yet, or the sampled data is still floating,
+// callers must call holdEdgeOpen(meta). That clears _edgeConsumed (but leaves
+// prevClk updated to reflect clk's current value), so a later iteration in the same
+// settleCircuit() call - once upstream logic has settled - is allowed to detect the
+// rising edge again and sample/gate correctly. This is safe even when en/we
+// genuinely stays 0 for the whole clock pulse (no race at all): holding the edge
+// open doesn't affect prevClk, so once clk actually falls and rises again on a real
+// pulse, edge detection still behaves correctly next time.
 function consumeRisingEdge(state, callStartState, clk, callId) {
   const isNewCall = state._callId !== callId;
   const alreadyConsumed = !isNewCall && !!state._edgeConsumed;
@@ -50,11 +53,11 @@ function consumeRisingEdge(state, callStartState, clk, callId) {
   };
 }
 
-// Call when `rising` was true this iteration but the write was skipped for a reason
-// that might only be "this pass hasn't converged yet" (en not yet 1, or the sampled
-// data bus was still floating) - keeps the edge available so a later iteration within
-// the same settleCircuit() call can retry once upstream logic has settled, instead of
-// permanently losing the write.
+// Call when `rising` was true but this pass wasn't the real write - either the
+// gating input (en/we) hasn't resolved to 1 yet, or the sampled data is still
+// floating (data source not yet evaluated this pass). Keeps the edge available so a
+// later iteration within the same settleCircuit() call can gate/sample the settled
+// values instead of permanently losing the write.
 function holdEdgeOpen(meta) {
   meta._edgeConsumed = false;
 }
@@ -88,10 +91,10 @@ registerComponentType({
     if (rst === 1) {
       q = 0;
     } else if (rising) {
-      if (en !== 1 || s === FLOATING || r === FLOATING) {
-        // en not yet resolved to 1, or s/r not settled yet this pass - try again
-        // next iteration instead of permanently losing this edge.
-        holdEdgeOpen(meta);
+      if (en !== 1) {
+        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
+      } else if (s === FLOATING || r === FLOATING) {
+        holdEdgeOpen(meta); // s/r not settled yet this pass - try again next iteration
       } else {
         const sv = s === 1, rv = r === 1;
         if (sv && rv) conflict = true;
@@ -137,8 +140,10 @@ registerComponentType({
     const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (rst === 1) {
       q = 0;
-    } else if (en === 1 && rising) {
-      if (j === FLOATING || k === FLOATING) {
+    } else if (rising) {
+      if (en !== 1) {
+        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
+      } else if (j === FLOATING || k === FLOATING) {
         holdEdgeOpen(meta); // j/k not settled yet this pass - try again next iteration
       } else {
         const jv = j === 1, kv = k === 1;
@@ -181,8 +186,10 @@ registerComponentType({
     const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (rst === 1) {
       q = 0;
-    } else if (en === 1 && rising) {
-      if (d === 0 || d === 1) {
+    } else if (rising) {
+      if (en !== 1) {
+        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
+      } else if (d === 0 || d === 1) {
         q = d;
       } else {
         holdEdgeOpen(meta); // d not settled yet this pass - try again next iteration
@@ -223,16 +230,23 @@ registerComponentType({
 
     if (rst === 1) {
       value = 0;
-    } else if (en === 1 && rising) {
-      const dBits = inputs.d || new Array(width).fill(FLOATING);
-      const v = toInt(dBits);
-      if (v !== null) {
-        value = v;
-      } else {
-        // d hasn't settled yet this pass (e.g. its source component runs later in
-        // this settleCircuit() call) - don't burn the edge, try again next iteration
-        // once d has a real value.
+    } else if (rising) {
+      if (en !== 1) {
+        // en hasn't resolved to 1 yet this pass (e.g. its source component runs
+        // later in this settleCircuit() call) - don't burn the edge, try again
+        // next iteration once en has its real value.
         holdEdgeOpen(meta);
+      } else {
+        const dBits = inputs.d || new Array(width).fill(FLOATING);
+        const v = toInt(dBits);
+        if (v !== null) {
+          value = v;
+        } else {
+          // d hasn't settled yet this pass (e.g. its source component runs later in
+          // this settleCircuit() call) - don't burn the edge, try again next iteration
+          // once d has a real value.
+          holdEdgeOpen(meta);
+        }
       }
     }
 
@@ -285,16 +299,23 @@ registerComponentType({
     const cs = ctrl(inputs.cs?.[0], 1);
     const enabled = ce === 1 && cs === 1;
     const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
-    if (we === 1 && rising && enabled) {
-      const dinBits = inputs.din || new Array(dataWidth).fill(FLOATING);
-      const v = toInt(dinBits);
-      if (v !== null) {
-        mem = mem.slice();
-        mem[addr % size] = v;
-      } else {
-        // din (or addr) not settled yet this pass - try again next iteration
-        // instead of permanently losing this write.
+    if (rising) {
+      if (we !== 1 || !enabled) {
+        // we/ce/cs haven't resolved to their enabling values yet this pass (or this
+        // pulse genuinely isn't a write) - don't burn the edge, try again next
+        // iteration once they've settled; harmless if they really do stay disabled.
         holdEdgeOpen(meta);
+      } else {
+        const dinBits = inputs.din || new Array(dataWidth).fill(FLOATING);
+        const v = toInt(dinBits);
+        if (v !== null) {
+          mem = mem.slice();
+          mem[addr % size] = v;
+        } else {
+          // din (or addr) not settled yet this pass - try again next iteration
+          // instead of permanently losing this write.
+          holdEdgeOpen(meta);
+        }
       }
     }
     const out = mem[addr % size] ?? 0;
@@ -427,8 +448,12 @@ registerComponentType({
     const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (rst === 1) {
       value = 0;
-    } else if (en === 1 && rising) {
-      value = dir === 1 ? (value + 1) % max : (value - 1 + max) % max;
+    } else if (rising) {
+      if (en !== 1) {
+        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
+      } else {
+        value = dir === 1 ? (value + 1) % max : (value - 1 + max) % max;
+      }
     }
     const tc = dir === 1 ? (value === max - 1 ? 1 : 0) : (value === 0 ? 1 : 0);
     return { outputs: { q: fromInt(value, width), tc: [tc] }, state: { value, ...meta } };
@@ -475,8 +500,10 @@ registerComponentType({
     const mask = width >= 31 ? 0xFFFFFFFF : (2 ** width - 1);
     if (rst === 1) {
       value = 0;
-    } else if (en === 1 && rising) {
-      if (ld === 1) {
+    } else if (rising) {
+      if (en !== 1) {
+        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
+      } else if (ld === 1) {
         const dBits = inputs.d || new Array(width).fill(FLOATING);
         const v = toInt(dBits);
         if (v !== null) {
