@@ -1,14 +1,6 @@
 import { getComponentType } from './registry.js';
 import { makeFloating, combineBits } from './bits.js';
 
-// Settle one circuit graph. Because feedback (latches built from gates, ring oscillators, ...)
-// is allowed, we can't just do a single topological pass: we re-evaluate every component
-// repeatedly, feeding each pass's outputs into the next, until two consecutive passes produce
-// identical wire values (stable) or `maxIters` is reached (treated as "still changing" - e.g.
-// an oscillator - which is fine, it'll simply be re-settled again next animation frame).
-//
-// forcedInputs: Map/object of { [PIN_IN instanceId]: bits }, used when this circuit is the
-// internal definition of a component being evaluated from a parent circuit.
 let globalCallCounter = 0;
 
 export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 48 } = {}) {
@@ -16,55 +8,67 @@ export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 
   const wireValues = new Map();
   const instanceOutputs = new Map();
   let stable = false;
+
   const callStartState = new Map(circuit.components.map((inst) => [inst.id, inst.state]));
 
-  for (let iter = 0; iter < maxIters; iter++) {
-    for (const inst of circuit.components) {
-      const def = getComponentType(inst.type);
-      if (!def) continue;
-      const pins = def.pins(inst.params || {});
-      const inputs = {};
-      for (const p of pins) {
-        if (p.dir !== 'in') continue;
+  // Precompute everything constant across iterations once, instead of every iteration.
+  const plan = [];
+  for (const inst of circuit.components) {
+    const def = getComponentType(inst.type);
+    if (!def) continue;
+    const pins = def.pins(inst.params || {});
+    const inPins = [];
+    const outPins = [];
+    for (const p of pins) {
+      if (p.dir === 'in') {
         const w = circuit.wireInto(inst.id, p.id);
-        inputs[p.id] = w && wireValues.has(w.id) ? wireValues.get(w.id) : makeFloating(p.width);
+        inPins.push({ id: p.id, width: p.width, wireId: w ? w.id : null });
+      } else {
+        const targetWires = circuit.wiresFrom(inst.id, p.id).map((w) => w.id);
+        outPins.push({ id: p.id, targetWires });
       }
-      const injected = def.isInterface === 'in' && Object.prototype.hasOwnProperty.call(forcedInputs, inst.id)
+    }
+    plan.push({
+      inst, def, inPins, outPins,
+      injected: def.isInterface === 'in' && Object.prototype.hasOwnProperty.call(forcedInputs, inst.id)
         ? forcedInputs[inst.id]
-        : undefined;
+        : undefined,
+      callStartState: callStartState.get(inst.id),
+    });
+  }
+
+  const tunnelInPlan = plan.filter((p) => p.def?.isTunnel === 'in');
+  const tunnelOutPlan = plan.filter((p) => p.def?.isTunnel === 'out');
+
+  let prevWireValues = null;
+
+  for (let iter = 0; iter < maxIters; iter++) {
+    for (const { inst, def, inPins, outPins, injected, callStartState: css } of plan) {
+      const inputs = {};
+      for (const p of inPins) {
+        inputs[p.id] = p.wireId && wireValues.has(p.wireId) ? wireValues.get(p.wireId) : makeFloating(p.width);
+      }
       const result = def.evaluate({
-        inputs,
-        state: inst.state,
-        params: inst.params || {},
-        now,
-        injected,
-        callStartState: callStartState.get(inst.id),
-        callId,
+        inputs, state: inst.state, params: inst.params || {}, now,
+        injected, callStartState: css, callId,
       });
-      // ... Rest unverändert
       inst.state = result.state ?? inst.state;
       instanceOutputs.set(inst.id, result.outputs || {});
-      for (const p of pins) {
-        if (p.dir !== 'out') continue;
+      for (const p of outPins) {
         const val = result.outputs && result.outputs[p.id];
         if (!val) continue;
-        for (const w of circuit.wiresFrom(inst.id, p.id)) wireValues.set(w.id, val);
+        for (const wireId of p.targetWires) wireValues.set(wireId, val);
       }
     }
 
-    // 2) named tunnels: every TUNNEL_IN feeds every TUNNEL_OUT sharing the same net name
     const nets = new Map();
-    for (const inst of circuit.components) {
-      const def = getComponentType(inst.type);
-      if (def?.isTunnel !== 'in') continue;
+    for (const { inst } of tunnelInPlan) {
       const val = inst.state?.last;
       if (!val) continue;
       const key = inst.params?.net || '';
       nets.set(key, nets.has(key) ? combineBits(nets.get(key), val) : val);
     }
-    for (const inst of circuit.components) {
-      const def = getComponentType(inst.type);
-      if (def?.isTunnel !== 'out') continue;
+    for (const { inst } of tunnelOutPlan) {
       const key = inst.params?.net || '';
       const val = nets.get(key);
       if (!val) continue;
@@ -72,22 +76,23 @@ export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 
       for (const w of circuit.wiresFrom(inst.id, 'out')) wireValues.set(w.id, val);
     }
 
-    const snap = snapshotOf(wireValues);
-    if (snap === prevSnapshot) { stable = true; break; }
-    prevSnapshot = snap;
+    if (prevWireValues && wireValuesEqual(prevWireValues, wireValues)) { stable = true; break; }
+    prevWireValues = new Map(wireValues);
   }
 
   return { wireValues, instanceOutputs, stable };
 }
 
-function snapshotOf(wireValues) {
-  let s = '';
-  for (const [id, bits] of wireValues) s += id + ':' + bits.join(',') + ';';
-  return s;
+function wireValuesEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const [id, bits] of a) {
+    const other = b.get(id);
+    if (!other || bits.length !== other.length) return false;
+    for (let i = 0; i < bits.length; i++) if (bits[i] !== other[i]) return false;
+  }
+  return true;
 }
 
-// Reset every component's runtime state back to its type's initial state (recursively for
-// composite components, since their nested sub-circuit lives inside instance.state).
 export function resetCircuitState(circuit) {
   for (const inst of circuit.components) {
     const def = getComponentType(inst.type);
