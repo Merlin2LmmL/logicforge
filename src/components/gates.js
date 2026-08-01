@@ -101,22 +101,50 @@ registerComponentType({
   category: 'Gatter',
   label: 'Buffer',
   color: '#7fd67f',
-  paramsSchema: [{ key: 'width', label: 'Bitbreite', kind: 'int', min: 1, max: 32, step: 1, default: 1 }],
+  paramsSchema: [
+    { key: 'width', label: 'Bitbreite', kind: 'int', min: 1, max: 32, step: 1, default: 1 },
+    { key: 'delayMs', label: 'Verzögerung (ms)', kind: 'int', min: 0, max: 60000, step: 1, default: 0 },
+  ],
   pins: (params) => [
     { id: 'in0', label: 'A', dir: 'in', width: params.width ?? 1, side: 'left', order: 0 },
     { id: 'out', label: 'Y', dir: 'out', width: params.width ?? 1, side: 'right', order: 0 },
   ],
   size: () => ({ w: 3, h: 2 }),
-  init: () => ({}),
-  evaluate: ({ inputs, params }) => {
+  init: () => ({ queue: [] }),
+  evaluate: ({ inputs, params, state }) => {
     const width = params.width ?? 1;
+    const delayMs = params.delayMs ?? 0;
     const a = inputs.in0 || new Array(width).fill(FLOATING);
-    return { outputs: { out: a.slice() }, state: {} };
+
+    if (delayMs <= 0) {
+      return { outputs: { out: a.slice() }, state: { queue: [] } };
+    }
+
+    const now = Date.now();
+    const queue = (state?.queue || []).slice();
+    queue.push({ t: now, value: a.slice() });
+
+    // Neuesten Eintrag suchen, der mindestens delayMs alt ist
+    let outValue = new Array(width).fill(FLOATING); // solange Puffer noch nicht "voll" ist
+    let cutoffIndex = -1;
+    for (let i = 0; i < queue.length; i++) {
+      if (queue[i].t <= now - delayMs) {
+        outValue = queue[i].value;
+        cutoffIndex = i;
+      } else {
+        break;
+      }
+    }
+
+    // alles vor dem zuletzt benutzten Eintrag verwerfen, den Rest behalten
+    const trimmed = cutoffIndex > 0 ? queue.slice(cutoffIndex) : queue;
+
+    return { outputs: { out: outValue.slice() }, state: { queue: trimmed } };
   },
   help: {
-    summary: 'Signalpuffer: gibt den Eingang unverändert weiter (1:1-Durchreichung).',
-    usage: 'Nützlich, um Signale sauber umzuleiten/aufzuteilen oder als Platzhalter für spätere Logik, ohne die eigentliche Funktion zu ändern.',
-    pins: { in0: 'Eingangssignal.', out: 'Identisches Signal wie in0.' },
+    summary: 'Signalpuffer: gibt den Eingang unverändert weiter, optional zeitlich verzögert.',
+    usage: 'Nützlich, um Signale sauber umzuleiten/aufzuteilen, als Platzhalter für spätere Logik, oder um eine reale Signallaufzeit (ms) zu simulieren.',
+    pins: { in0: 'Eingangssignal.', out: 'Signal wie in0, um delayMs (ms) verzögert.' },
   },
 });
 
