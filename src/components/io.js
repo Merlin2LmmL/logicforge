@@ -127,17 +127,14 @@ registerComponentType({
   },
   evaluate: ({ state, params, now, callId }) => {
   const hz = params.hz ?? 0;
-  if (hz <= 0) {
-    if (!state.armed) return { outputs: { out: [0] }, state };
-    const isNewCall = state._callId !== callId;
-    if (isNewCall && state._pulsedThisArm) {
-      return { outputs: { out: [0] }, state: { armed: false, _callId: callId, _pulsedThisArm: false } };
+    if (hz <= 0) {
+      if (!state.armed) return { outputs: { out: [0] }, state };
+      const isNewCall = state._callId !== callId;
+      if (isNewCall && state._pulsedThisArm) {
+        return { outputs: { out: [0] }, state: { armed: false, _callId: callId, _pulsedThisArm: false } };
+      }
+      return { outputs: { out: [1] }, state: { armed: true, _callId: callId, _pulsedThisArm: true } };
     }
-    return { outputs: { out: [1] }, state: { armed: true, _callId: callId, _pulsedThisArm: true } };
-  }
-  // automatischer Modus unverändert
-},
-
     // Automatischer Modus: `now` ist über den gesamten Aufruf konstant, daher betrifft
     // dieses Problem hier nicht - `elapsed === 0` ist entweder in JEDER Iteration wahr
     // oder in keiner.
