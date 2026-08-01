@@ -164,27 +164,37 @@ registerComponentType({
   size: (params) => ({ w: 4, h: Math.max(4, Math.ceil((params.width ?? 8) / 4) + 2) }),
   init: (params) => ({ value: 0, prevClk: 0, width: params.width ?? 8 }),
   evaluate: ({ inputs, state, params, callStartState }) => {
-    const width = params.width ?? 8;
-    const clk = ctrl(inputs.clk?.[0], 0);
-    const en = ctrl(inputs.en?.[0], 1);
-    const rst = ctrl(inputs.rst?.[0], 0);
-    let value = state.value ?? 0;
-    const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
-    console.log('[REGISTER]', {
-      clk, en, rst, rising,
-      callStartPrevClk: callStartState?.prevClk,
-      d: inputs.d,
-      currentValue: value,
-    });
-    if (rst === 1) {
-      value = 0;
-    } else if (en === 1 && rising) {
-      const dBits = inputs.d || new Array(width).fill(FLOATING);
-      const v = toInt(dBits);
-      if (v !== null) value = v;
-    }
-    return { outputs: { q: fromInt(value, width) }, state: { value, prevClk: clk, width } };
-  },
+  const width = params.width ?? 8;
+  const clk = ctrl(inputs.clk?.[0], 0);
+  const en = ctrl(inputs.en?.[0], 1);
+  const rst = ctrl(inputs.rst?.[0], 0);
+  let value = state.value ?? 0;
+
+  // callStartState is a freshly-built object each settleCircuit() call, so comparing
+  // its reference tells us whether we're still inside the same call (glitches/multiple
+  // iterations with clk=1 are fine, already consumed) or a genuinely new call started.
+  const isNewCall = state._callRef !== callStartState;
+  const edgeAlreadyConsumed = isNewCall ? false : !!state._edgeConsumed;
+  const baselineLow = (callStartState ?? state).prevClk === 0;
+  const rising = !edgeAlreadyConsumed && baselineLow && clk === 1;
+
+  if (rst === 1) {
+    value = 0;
+  } else if (en === 1 && rising) {
+    const dBits = inputs.d || new Array(width).fill(FLOATING);
+    const v = toInt(dBits);
+    if (v !== null) value = v;
+  }
+
+  return {
+    outputs: { q: fromInt(value, width) },
+    state: {
+      value, prevClk: clk, width,
+      _callRef: callStartState,
+      _edgeConsumed: edgeAlreadyConsumed || rising,
+    },
+  };
+},
   help: {
     summary: 'Register: mehrbreiter D-Flipflop-Block, übernimmt bei jeder steigenden CLK-Flanke den gesamten D-Bus nach Q.',
     usage: 'Bitbreite über Parameter einstellen. D anschließen, bei steigender CLK-Flanke (EN=1) wird der komplette Wert übernommen. Typisch als Akkumulator, Zwischenspeicher oder Pipeline-Stufe.',
