@@ -5,6 +5,26 @@ function bit1(v) { return v === 1 ? 1 : v === 0 ? 0 : FLOATING; }
 // Control pins default to a sane value when left unconnected: enable=on, reset/clock=off.
 function ctrl(v, fallback) { return v === 1 || v === 0 ? v : fallback; }
 
+// Detects a rising edge exactly once per settleCircuit() call, no matter how many
+// iterations within that call see clk resolve to 1. callStartState is a fresh object
+// reference each call (built once in simulator.js before the iteration loop), so
+// comparing state._callRef against it tells us whether we're still inside the same
+// call (further clk=1 iterations are the same edge, already consumed) or a new call
+// has started (a fresh edge is possible again). Without this, comparing only against
+// callStartState.prevClk (frozen for the whole call) lets every iteration where clk
+// happens to resolve to 1 re-trigger the edge - which is exactly what caused counters
+// fed back into their own D input to run away instead of stepping by exactly 1.
+function consumeRisingEdge(state, callStartState, clk) {
+  const isNewCall = state._callRef !== callStartState;
+  const alreadyConsumed = !isNewCall && !!state._edgeConsumed;
+  const baselineLow = (callStartState ?? state).prevClk === 0;
+  const rising = !alreadyConsumed && baselineLow && clk === 1;
+  return {
+    rising,
+    meta: { _callRef: callStartState, _edgeConsumed: alreadyConsumed || rising, prevClk: clk },
+  };
+}
+
 registerComponentType({
   type: 'SRFF',
   category: 'Speicher',
@@ -34,25 +54,20 @@ registerComponentType({
     const rst = ctrl(inputs.rst?.[0], 0);
     let q = state.q ?? 0;
     let conflict = false;
+    // consumeRisingEdge guarantees at most one edge is consumed per settleCircuit()
+    // call, regardless of how many iterations within that call see clk resolve to 1.
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
     if (rst === 1) {
       q = 0;
-    } else if (en === 1) {
-      // Compare against the state from BEFORE this settle() call (frozen for the whole
-      // call), not state.prevClk (which is updated every settle iteration). Otherwise a
-      // rising edge can be "consumed" in an early iteration before inputs coming from
-      // multi-stage combinational logic (e.g. an ENCODER/MUX) have finished propagating,
-      // silently latching a stale/floating value. See simulator.js for details.
-      const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
-      if (rising) {
-        const sv = s === 1, rv = r === 1;
-        if (sv && rv) conflict = true;
-        else if (sv) q = 1;
-        else if (rv) q = 0;
-      }
+    } else if (en === 1 && rising) {
+      const sv = s === 1, rv = r === 1;
+      if (sv && rv) conflict = true;
+      else if (sv) q = 1;
+      else if (rv) q = 0;
     }
     const qOut = conflict ? CONFLICT : q;
     const nqOut = conflict ? CONFLICT : (q ? 0 : 1);
-    return { outputs: { q: [qOut], nq: [nqOut] }, state: { q, prevClk: clk } };
+    return { outputs: { q: [qOut], nq: [nqOut] }, state: { q, ...meta } };
   },
   help: {
     summary: 'SR-Flipflop: Set/Reset-Speicher, taktflankengesteuert (wie DFF/Register). S=R=1 ist der klassische verbotene Zustand und wird als Konflikt (X) ausgegeben.',
@@ -87,20 +102,16 @@ registerComponentType({
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let q = state.q ?? 0;
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
     if (rst === 1) {
       q = 0;
-    } else if (en === 1) {
-      // See SRFF above: compare against the pre-call snapshot, not the live per-iteration
-      // state, so a rising edge isn't consumed before slower combinational inputs settle.
-      const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
-      if (rising) {
-        const jv = j === 1, kv = k === 1;
-        if (jv && kv) q = q ? 0 : 1;
-        else if (jv) q = 1;
-        else if (kv) q = 0;
-      }
+    } else if (en === 1 && rising) {
+      const jv = j === 1, kv = k === 1;
+      if (jv && kv) q = q ? 0 : 1;
+      else if (jv) q = 1;
+      else if (kv) q = 0;
     }
-    return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, prevClk: clk } };
+    return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, ...meta } };
   },
   help: {
     summary: 'JK-Flipflop: wie SRFF, aber J=K=1 toggelt den Zustand statt einen verbotenen Zustand zu erzeugen.',
@@ -131,15 +142,13 @@ registerComponentType({
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let q = state.q ?? 0;
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
     if (rst === 1) {
       q = 0;
-    } else if (en === 1) {
-      // See SRFF above: compare against the pre-call snapshot, not the live per-iteration
-      // state, so a rising edge isn't consumed before slower combinational inputs settle.
-      const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
-      if (rising && (d === 0 || d === 1)) q = d;
+    } else if (en === 1 && rising && (d === 0 || d === 1)) {
+      q = d;
     }
-    return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, prevClk: clk } };
+    return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, ...meta } };
   },
   help: {
     summary: 'D-Flipflop: übernimmt bei jeder steigenden CLK-Flanke den Wert von D nach Q - der einfachste 1-Bit-Speicherbaustein.',
@@ -164,37 +173,27 @@ registerComponentType({
   size: (params) => ({ w: 4, h: Math.max(4, Math.ceil((params.width ?? 8) / 4) + 2) }),
   init: (params) => ({ value: 0, prevClk: 0, width: params.width ?? 8 }),
   evaluate: ({ inputs, state, params, callStartState }) => {
-  const width = params.width ?? 8;
-  const clk = ctrl(inputs.clk?.[0], 0);
-  const en = ctrl(inputs.en?.[0], 1);
-  const rst = ctrl(inputs.rst?.[0], 0);
-  let value = state.value ?? 0;
+    const width = params.width ?? 8;
+    const clk = ctrl(inputs.clk?.[0], 0);
+    const en = ctrl(inputs.en?.[0], 1);
+    const rst = ctrl(inputs.rst?.[0], 0);
+    let value = state.value ?? 0;
 
-  // callStartState is a freshly-built object each settleCircuit() call, so comparing
-  // its reference tells us whether we're still inside the same call (glitches/multiple
-  // iterations with clk=1 are fine, already consumed) or a genuinely new call started.
-  const isNewCall = state._callRef !== callStartState;
-  const edgeAlreadyConsumed = isNewCall ? false : !!state._edgeConsumed;
-  const baselineLow = (callStartState ?? state).prevClk === 0;
-  const rising = !edgeAlreadyConsumed && baselineLow && clk === 1;
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
 
-  if (rst === 1) {
-    value = 0;
-  } else if (en === 1 && rising) {
-    const dBits = inputs.d || new Array(width).fill(FLOATING);
-    const v = toInt(dBits);
-    if (v !== null) value = v;
-  }
+    if (rst === 1) {
+      value = 0;
+    } else if (en === 1 && rising) {
+      const dBits = inputs.d || new Array(width).fill(FLOATING);
+      const v = toInt(dBits);
+      if (v !== null) value = v;
+    }
 
-  return {
-    outputs: { q: fromInt(value, width) },
-    state: {
-      value, prevClk: clk, width,
-      _callRef: callStartState,
-      _edgeConsumed: edgeAlreadyConsumed || rising,
-    },
-  };
-},
+    return {
+      outputs: { q: fromInt(value, width) },
+      state: { value, width, ...meta },
+    };
+  },
   help: {
     summary: 'Register: mehrbreiter D-Flipflop-Block, übernimmt bei jeder steigenden CLK-Flanke den gesamten D-Bus nach Q.',
     usage: 'Bitbreite über Parameter einstellen. D anschließen, bei steigender CLK-Flanke (EN=1) wird der komplette Wert übernommen. Typisch als Akkumulator, Zwischenspeicher oder Pipeline-Stufe.',
@@ -242,10 +241,11 @@ registerComponentType({
     const ce = ctrl(inputs.ce?.[0], 1);
     const cs = ctrl(inputs.cs?.[0], 1);
     const enabled = ce === 1 && cs === 1;
-    // See REGISTER above: compare against the pre-call snapshot, not the live
-    // per-iteration state, so a rising edge isn't consumed before DIN/ADDR (which may come
-    // from multi-stage combinational logic) have finished propagating this call.
-    const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
+    // See REGISTER above: consumeRisingEdge guarantees at most one write per
+    // settleCircuit() call, so DIN/ADDR (which may come from multi-stage combinational
+    // logic) get a chance to fully propagate before the write is committed, and the
+    // same edge can never be written twice within one call.
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
     if (we === 1 && rising && enabled) {
       const dinBits = inputs.din || new Array(dataWidth).fill(FLOATING);
       const v = toInt(dinBits);
@@ -256,7 +256,7 @@ registerComponentType({
     }
     const out = mem[addr % size] ?? 0;
     const dout = enabled ? fromInt(out, dataWidth) : new Array(dataWidth).fill(FLOATING);
-    return { outputs: { dout }, state: { mem, prevClk: clk } };
+    return { outputs: { dout }, state: { mem, ...meta } };
   },
   help: {
     summary: 'RAM: adressierter, beschreib- und lesbarer Speicher (wie ein SRAM-Baustein), Inhalt bleibt bis zum Reset/Neuladen erhalten.',
@@ -406,17 +406,18 @@ registerComponentType({
     const rst = ctrl(inputs.rst?.[0], 0);
     const dir = ctrl(inputs.dir?.[0], 1); // 1 = hoch (Standard), 0 = runter
     let value = state.value ?? 0;
-    // See REGISTER above: compare against the pre-call snapshot, not the live
-    // per-iteration state, so a rising edge isn't consumed before DIR (or any input coming
-    // from combinational logic) has finished propagating this call.
-    const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
+    // consumeRisingEdge guarantees at most one increment/decrement per
+    // settleCircuit() call, regardless of how many iterations within that call see
+    // clk resolve to 1 - this is what previously let a counter fed back into its own
+    // D input (or its own clk chain) run away and count far more than once per pulse.
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
     if (rst === 1) {
       value = 0;
     } else if (en === 1 && rising) {
       value = dir === 1 ? (value + 1) % max : (value - 1 + max) % max;
     }
     const tc = dir === 1 ? (value === max - 1 ? 1 : 0) : (value === 0 ? 1 : 0);
-    return { outputs: { q: fromInt(value, width), tc: [tc] }, state: { value, prevClk: clk } };
+    return { outputs: { q: fromInt(value, width), tc: [tc] }, state: { value, ...meta } };
   },
   help: {
     summary: 'Zähler: erhöht (oder verringert) seinen Wert bei jeder steigenden CLK-Flanke, mit Überlauf/Wrap-around.',
@@ -456,10 +457,10 @@ registerComponentType({
     const sin = ctrl(inputs.sin?.[0], 0);
     let value = state.value ?? 0;
     let soutBit = dir === 'left' ? (value >> (width - 1)) & 1 : value & 1;
-    // See REGISTER above: compare against the pre-call snapshot, not the live
-    // per-iteration state, so a rising edge isn't consumed before D (which may come from
-    // multi-stage combinational logic) has finished propagating this call.
-    const rising = (callStartState ?? state).prevClk === 0 && clk === 1;
+    // See REGISTER/COUNTER above: consumeRisingEdge guarantees at most one
+    // shift/load per settleCircuit() call, so D (which may come from multi-stage
+    // combinational logic) has a chance to fully propagate before it's latched.
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
     const mask = width >= 31 ? 0xFFFFFFFF : (2 ** width - 1);
     if (rst === 1) {
       value = 0;
@@ -476,7 +477,7 @@ registerComponentType({
         value = ((value >>> 1) | ((sin ? 1 : 0) << (width - 1))) & mask;
       }
     }
-    return { outputs: { q: fromInt(value, width), sout: [soutBit] }, state: { value, prevClk: clk } };
+    return { outputs: { q: fromInt(value, width), sout: [soutBit] }, state: { value, ...meta } };
   },
   help: {
     summary: 'Schieberegister: schiebt seinen Inhalt bei jeder steigenden CLK-Flanke um 1 Bit (links oder rechts), oder lädt bei LD=1 einen kompletten Wert parallel.',
