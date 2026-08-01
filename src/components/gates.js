@@ -1,5 +1,5 @@
 import { registerComponentType } from '../core/registry.js';
-import { FLOATING, CONFLICT } from '../core/bits.js';
+import { FLOATING, CONFLICT, equalBits } from '../core/bits.js';
 
 function bitwiseGate(inputsArr, width, op, identity) {
   const out = new Array(width);
