@@ -6,14 +6,14 @@ function bit1(v) { return v === 1 ? 1 : v === 0 ? 0 : FLOATING; }
 function ctrl(v, fallback) { return v === 1 || v === 0 ? v : fallback; }
 
 // Detects a rising edge exactly once per settleCircuit() call, no matter how many
-// iterations within that call see clk resolve to 1. callStartState is a fresh object
-// reference each call (built once in simulator.js before the iteration loop), so
-// comparing state._callRef against it tells us whether we're still inside the same
-// call (further clk=1 iterations are the same edge, already consumed) or a new call
-// has started (a fresh edge is possible again). Without this, comparing only against
-// callStartState.prevClk (frozen for the whole call) lets every iteration where clk
-// happens to resolve to 1 re-trigger the edge - which is exactly what caused counters
-// fed back into their own D input to run away instead of stepping by exactly 1.
+// iterations within that call see clk resolve to 1, and no matter which order
+// components are evaluated in (which previously made "how many times did this
+// component see clk=1 before the call settled" effectively random per component).
+// callId is a monotonically increasing integer minted once per settleCircuit() call
+// (see simulator.js) and passed through evaluate() - comparing against it (not an
+// object reference, which can be ambiguous across sub-stepped/cloned state) tells us
+// whether we're still inside the same call (further clk=1 iterations are the same
+// edge, already consumed) or a new call has started (a fresh edge is possible again).
 function consumeRisingEdge(state, callStartState, clk, callId) {
   const isNewCall = state._callId !== callId;
   const alreadyConsumed = !isNewCall && !!state._edgeConsumed;
@@ -42,11 +42,7 @@ registerComponentType({
   ],
   size: () => ({ w: 3, h: 4 }),
   init: () => ({ q: 0, prevClk: 0 }),
-  // Taktflankengesteuert wie das D-Flipflop (nicht das reine Pegel-Latch), damit es
-  // sich in synchronen Schaltungen genauso verhält wie DFF/Register. S=R=1 ist der
-  // klassische verbotene Zustand eines SR-Speichers und wird als Konflikt ausgegeben,
-  // statt stillschweigend einen der beiden Fälle zu bevorzugen.
-  evaluate: ({ inputs, state, callStartState }) => {
+  evaluate: ({ inputs, state, callStartState, callId }) => {
     const s = bit1(inputs.s?.[0]);
     const r = bit1(inputs.r?.[0]);
     const clk = ctrl(inputs.clk?.[0], 0);
@@ -54,9 +50,7 @@ registerComponentType({
     const rst = ctrl(inputs.rst?.[0], 0);
     let q = state.q ?? 0;
     let conflict = false;
-    // consumeRisingEdge guarantees at most one edge is consumed per settleCircuit()
-    // call, regardless of how many iterations within that call see clk resolve to 1.
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (rst === 1) {
       q = 0;
     } else if (en === 1 && rising) {
@@ -93,16 +87,14 @@ registerComponentType({
   ],
   size: () => ({ w: 3, h: 4 }),
   init: () => ({ q: 0, prevClk: 0 }),
-  // J=K=1 toggelt (der Fall, der beim SR-Flipflop verboten ist) - das ist der ganze
-  // Sinn des JK-Typs, deshalb hier kein Konfliktpfad nötig.
-  evaluate: ({ inputs, state, callStartState }) => {
+  evaluate: ({ inputs, state, callStartState, callId }) => {
     const j = bit1(inputs.j?.[0]);
     const k = bit1(inputs.k?.[0]);
     const clk = ctrl(inputs.clk?.[0], 0);
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let q = state.q ?? 0;
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (rst === 1) {
       q = 0;
     } else if (en === 1 && rising) {
@@ -136,13 +128,13 @@ registerComponentType({
   ],
   size: () => ({ w: 3, h: 4 }),
   init: () => ({ q: 0, prevClk: 0 }),
-  evaluate: ({ inputs, state, callStartState }) => {
+  evaluate: ({ inputs, state, callStartState, callId }) => {
     const d = bit1(inputs.d?.[0]);
     const clk = ctrl(inputs.clk?.[0], 0);
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let q = state.q ?? 0;
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (rst === 1) {
       q = 0;
     } else if (en === 1 && rising && (d === 0 || d === 1)) {
@@ -172,14 +164,14 @@ registerComponentType({
   ],
   size: (params) => ({ w: 4, h: Math.max(4, Math.ceil((params.width ?? 8) / 4) + 2) }),
   init: (params) => ({ value: 0, prevClk: 0, width: params.width ?? 8 }),
-  evaluate: ({ inputs, state, params, callStartState }) => {
+  evaluate: ({ inputs, state, params, callStartState, callId }) => {
     const width = params.width ?? 8;
     const clk = ctrl(inputs.clk?.[0], 0);
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let value = state.value ?? 0;
 
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
 
     if (rst === 1) {
       value = 0;
@@ -224,11 +216,7 @@ registerComponentType({
   ],
   size: () => ({ w: 4, h: 7 }),
   init: (params) => ({ mem: presetToMem(params), prevClk: 0 }),
-  // CE (Chip Enable) und CS (Chip Select) entsprechen den Pins realer SRAM-Bausteine:
-  // beide unbeschaltet -> Baustein aktiv (Rückwärtskompatibilität mit bestehenden
-  // Schaltungen ohne diese Pins). Ist einer der beiden 0, tristated der Ausgang und
-  // Schreibzugriffe werden ignoriert, so wie beim echten Chip.
-  evaluate: ({ inputs, state, params, callStartState }) => {
+  evaluate: ({ inputs, state, params, callStartState, callId }) => {
     const addrWidth = Math.min(params.addrWidth ?? 4, MAX_ADDR_BITS);
     const dataWidth = params.dataWidth ?? 8;
     const size = 2 ** addrWidth;
@@ -241,11 +229,7 @@ registerComponentType({
     const ce = ctrl(inputs.ce?.[0], 1);
     const cs = ctrl(inputs.cs?.[0], 1);
     const enabled = ce === 1 && cs === 1;
-    // See REGISTER above: consumeRisingEdge guarantees at most one write per
-    // settleCircuit() call, so DIN/ADDR (which may come from multi-stage combinational
-    // logic) get a chance to fully propagate before the write is committed, and the
-    // same edge can never be written twice within one call.
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (we === 1 && rising && enabled) {
       const dinBits = inputs.din || new Array(dataWidth).fill(FLOATING);
       const v = toInt(dinBits);
@@ -272,22 +256,6 @@ registerComponentType({
     },
   },
 });
-
-// ---------------------------------------------------------------------------------
-// ROM: bewusst keine Kopie von RAM ohne Schreibpin, sondern strukturell anders:
-//  - rein kombinatorisch, kein Takt (echte (a)synchrone ROM-Chips liefern Daten
-//    direkt aus der Adresse, es gibt keine Flanke abzuwarten)
-//  - Speicher als Sparse-Map statt dichtem Array, deshalb ist eine sehr große
-//    Adressbreite (bis 24 Bit / 16M Worte) ohne Speicherexplosion möglich, auch
-//    wenn nur ein kleiner Adressbereich tatsächlich programmiert ist
-//  - Inhalt wird als kleines Programm-artiges Textformat eingegeben (Adressmarken
-//    "@ADDR" / "ADDR:" plus fortlaufende Hex-Werte, Kommentare mit ; oder #),
-//    nicht als ein einziger langer Hex-Blob - realistischer zum Schreiben von
-//    Bootcode / Microcode von Hand
-//  - konfigurierbarer Füllwert für unprogrammierte Zellen (z.B. eine NOP-Opcode
-//    statt still 0)
-//  - CE/OE statt WE/CLK, wie am echten ROM-Baustein
-// ---------------------------------------------------------------------------------
 
 function parseRomProgram(text) {
   const map = new Map();
@@ -337,8 +305,6 @@ registerComponentType({
     { id: 'oe', label: 'OE', dir: 'in', width: 1, side: 'left', order: 2 },
     { id: 'dout', label: 'DO', dir: 'out', width: params.dataWidth ?? 8, side: 'right', order: 0 },
   ],
-  // Deutlich mehr Grundfläche als RAM: ROM soll als Nachschlagewerk/Programmspeicher
-  // tatsächlich benutzbar sein, nicht nur eine Blackbox mit vier Pins.
   size: () => ({ w: 6, h: 8 }),
   init: (params) => ({
     mem: parseRomProgram(params.preset),
@@ -351,11 +317,6 @@ registerComponentType({
     const dataWidth = params.dataWidth ?? 8;
     let mem = state.mem;
     let fill = state.fill;
-    // Verteidigung gegen alte Speicherstände (Autosave/.lgf), die VOR dem Map-sicheren
-    // Serialisierungs-Fix (model.js/fileformat.js/library.js) angelegt wurden: dort wurde
-    // die Map beim Speichern/Laden lautlos zu einem normalen Objekt `{}`, was hier zum
-    // Absturz führte ("mem.has is not a function"). Statt zu crashen, wird in dem Fall
-    // das Programm einfach neu aus dem Preset geparst.
     if (!(mem instanceof Map)) mem = parseRomProgram(params.preset);
     else if (state.cachedPreset !== params.preset) mem = parseRomProgram(params.preset);
     if (state.cachedFill !== params.fill) fill = parseInt(params.fill ?? '0', 16) || 0;
@@ -396,21 +357,15 @@ registerComponentType({
   ],
   size: () => ({ w: 4, h: 5 }),
   init: () => ({ value: 0, prevClk: 0 }),
-  // TC (Terminal Count) geht auf 1, sobald der Zähler seinen Endwert erreicht -
-  // nützlich zum Kaskadieren mehrerer Zähler zu breiteren Zählketten.
-  evaluate: ({ inputs, state, params, callStartState }) => {
+  evaluate: ({ inputs, state, params, callStartState, callId }) => {
     const width = params.width ?? 8;
     const max = 2 ** width;
     const clk = ctrl(inputs.clk?.[0], 0);
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
-    const dir = ctrl(inputs.dir?.[0], 1); // 1 = hoch (Standard), 0 = runter
+    const dir = ctrl(inputs.dir?.[0], 1);
     let value = state.value ?? 0;
-    // consumeRisingEdge guarantees at most one increment/decrement per
-    // settleCircuit() call, regardless of how many iterations within that call see
-    // clk resolve to 1 - this is what previously let a counter fed back into its own
-    // D input (or its own clk chain) run away and count far more than once per pulse.
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     if (rst === 1) {
       value = 0;
     } else if (en === 1 && rising) {
@@ -447,7 +402,7 @@ registerComponentType({
   ],
   size: () => ({ w: 4, h: 6 }),
   init: () => ({ value: 0, prevClk: 0 }),
-  evaluate: ({ inputs, state, params, callStartState }) => {
+  evaluate: ({ inputs, state, params, callStartState, callId }) => {
     const width = params.width ?? 8;
     const dir = params.direction ?? 'left';
     const clk = ctrl(inputs.clk?.[0], 0);
@@ -457,10 +412,7 @@ registerComponentType({
     const sin = ctrl(inputs.sin?.[0], 0);
     let value = state.value ?? 0;
     let soutBit = dir === 'left' ? (value >> (width - 1)) & 1 : value & 1;
-    // See REGISTER/COUNTER above: consumeRisingEdge guarantees at most one
-    // shift/load per settleCircuit() call, so D (which may come from multi-stage
-    // combinational logic) has a chance to fully propagate before it's latched.
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk);
+    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
     const mask = width >= 31 ? 0xFFFFFFFF : (2 ** width - 1);
     if (rst === 1) {
       value = 0;
