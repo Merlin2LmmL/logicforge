@@ -49,51 +49,149 @@ registerComponentType({
   category: 'Ein-/Ausgabe',
   label: 'Clock',
   color: '#e0e6ec',
-  // Marks this as a component whose OUTPUT can change over time on its own (i.e. without
-  // any input/state change triggering it), which the editor's main loop (src/ui/editor.js,
-  // `circuitHasActiveClock`) uses to decide whether a frame needs fine time-sliced
-  // sub-stepping at all. Only relevant when hz > 0 - at hz === 0 a Clock is just a manual
-  // toggle like a Switch and never changes on its own between clicks.
   isClock: true,
   paramsSchema: [
-    { key: 'hz', label: 'Frequenz (Hz), 0 = manuell', kind: 'int', min: 0, max: 1_000_000, step: 1, default: 1 },
-    { key: 'pulseMs', label: 'Impulsdauer (ms), 0 = 50% Tastgrad', kind: 'int', min: 0, max: 1_000_000, step: 1, default: 0 },
+    {
+      key: 'hz',
+      label: 'Frequenz (Hz), 0 = manuell',
+      kind: 'int',
+      min: 0,
+      max: 1_000_000,
+      step: 1,
+      default: 1,
+    },
   ],
   pins: () => [{ id: 'out', label: '', dir: 'out', width: 1, side: 'right', order: 0 }],
   size: () => ({ w: 2, h: 2 }),
   init: () => ({ value: 0, cycleStart: 0 }),
   interactive: true,
-  // Manueller Modus (hz=0): normaler Ein/Aus-Klick, kein Timing beteiligt.
+
   onActivate: (state, params) => {
     if ((params?.hz ?? 0) > 0) return state;
     return { ...state, value: state.value ? 0 : 1 };
   },
-  // Phasenbasiert statt Toggle-mit-Delta: die Zykluslänge wird aus `now` direkt
-  // hergeleitet (elapsed % period), statt bei jedem Tick zu toggeln. Das verhindert
-  // Drift durch unregelmäßige Frame-Zeiten und erlaubt eine von der Frequenz
-  // unabhängige Impulsdauer (Tastgrad ungleich 50%).
+
   evaluate: ({ state, params, now }) => {
     const hz = params.hz ?? 0;
+
     if (hz <= 0) {
       return { outputs: { out: [state.value ?? 0] }, state };
     }
+
     const period = 1000 / hz;
-    const pulse = Math.min(params.pulseMs > 0 ? params.pulseMs : period / 2, period);
+    const pulse = period / 2;
+
     let cycleStart = state.cycleStart || 0;
     let elapsed = now - cycleStart;
+
     if (elapsed < 0 || elapsed >= period) {
-      // Zyklusstart neu ausrichten (z.B. nach Frequenzänderung oder Tab-Pause),
-      // statt aufzusummieren und wegzudriften.
       cycleStart = now - (((elapsed % period) + period) % period);
       elapsed = now - cycleStart;
     }
+
     const value = elapsed < pulse ? 1 : 0;
-    return { outputs: { out: [value] }, state: { value, cycleStart } };
+
+    return {
+      outputs: { out: [value] },
+      state: { value, cycleStart },
+    };
   },
+
   help: {
-    summary: 'Taktgeber: bei Frequenz 0 ein manueller Ein/Aus-Schalter, bei Frequenz >0 ein automatischer Rechteck-Oszillator.',
-    usage: 'Frequenz (Hz) = 0 lässt sich per Klick manuell umschalten, ideal zum schrittweisen Debuggen von Flipflops/Registern. Frequenz >0 läuft automatisch; Impulsdauer=0 ergibt 50% Tastgrad, sonst feste Impulslänge in ms.',
-    pins: { out: 'Taktsignal.' },
+    summary:
+      'Taktgeber: bei Frequenz 0 ein manueller Ein/Aus-Schalter, bei Frequenz >0 ein automatischer Rechteck-Oszillator mit 50% Tastgrad.',
+    usage:
+      'Frequenz (Hz) = 0 lässt sich per Klick manuell umschalten. Frequenz >0 erzeugt einen kontinuierlichen Takt mit 50% Tastgrad.',
+    pins: {
+      out: 'Taktsignal.',
+    },
+  },
+});
+
+registerComponentType({
+  type: 'STEP_CLOCK',
+  category: 'Ein-/Ausgabe',
+  label: 'Impuls-Takt',
+  color: '#e0e6ec',
+
+  isClock: true,
+
+  paramsSchema: [
+    {
+      key: 'hz',
+      label: 'Frequenz (Hz), 0 = manuell',
+      kind: 'int',
+      min: 0,
+      max: 1_000_000,
+      step: 1,
+      default: 0,
+    },
+  ],
+
+  pins: () => [{ id: 'out', label: '', dir: 'out', width: 1, side: 'right', order: 0 }],
+  size: () => ({ w: 2, h: 2 }),
+
+  init: () => ({
+    armed: false,
+    fired: false,
+    cycleStart: 0,
+  }),
+
+  interactive: true,
+
+  onActivate: (state, params) => {
+    if ((params?.hz ?? 0) > 0) return state;
+    return state.armed ? state : { ...state, armed: true, fired: false };
+  },
+
+  evaluate: ({ state, params, now }) => {
+    const hz = params.hz ?? 0;
+
+    // Manual mode
+    if (hz <= 0) {
+      if (state.armed && !state.fired) {
+        return {
+          outputs: { out: [1] },
+          state: { ...state, armed: false, fired: true },
+        };
+      }
+
+      return {
+        outputs: { out: [0] },
+        state,
+      };
+    }
+
+    // Automatic mode
+    const period = 1000 / hz;
+
+    let cycleStart = state.cycleStart || 0;
+    let elapsed = now - cycleStart;
+
+    if (elapsed < 0 || elapsed >= period) {
+      cycleStart = now - (((elapsed % period) + period) % period);
+      elapsed = now - cycleStart;
+    }
+
+    const pulse = elapsed === 0;
+
+    return {
+      outputs: { out: [pulse ? 1 : 0] },
+      state: {
+        ...state,
+        cycleStart,
+      },
+    };
+  },
+
+  help: {
+    summary:
+      'Einzelimpuls-Takt: bei Frequenz 0 manuell, bei Frequenz >0 genau ein Impuls pro Periode.',
+    usage:
+      'Mit Frequenz 0 erzeugt jeder Klick genau einen Impuls. Mit Frequenz >0 wird automatisch einmal pro Periode ein einzelner Impuls erzeugt.',
+    pins: {
+      out: 'Einzelimpuls.',
+    },
   },
 });
 
