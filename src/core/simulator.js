@@ -3,6 +3,17 @@ import { makeFloating, combineBits } from './bits.js';
 
 let globalCallCounter = 0;
 
+// A component is "clocked" (has its own storage, gated by a clk pin) if its pin list
+// includes a pin literally named 'clk'. Matches every stateful type in memory.js:
+// DFF, REGISTER, COUNTER, SHIFTREG, RAM, JKFF, SRFF.
+function isClocked(def, params) {
+  try {
+    return def.pins(params || {}).some((p) => p.id === 'clk' && p.dir === 'in');
+  } catch {
+    return false;
+  }
+}
+
 // Topologically sorts `plan` so that, within a single iteration of the settle loop,
 // a component runs after every component that feeds one of its inputs (when that's
 // possible - i.e. wherever the dependency graph isn't cyclic). This is what makes
@@ -11,10 +22,27 @@ let globalCallCounter = 0;
 // circuit.components order, so a consumer could easily run before its producer in the
 // *same* pass, see a floating/stale input, and have to wait for a whole extra
 // iteration (or two, with the memory.js two-read staleness guard) to pick up the real
-// value. Genuine cycles (real combinational loops, or the intentional feedback loop
-// through a register's own Q -> ... -> D path) can't be linearized - those components
-// are appended in their original relative order and still resolved by the outer
-// iterate-to-fixed-point loop in settleCircuit, exactly as before.
+// value.
+//
+// Clocked components are deliberately excluded from the "wait for my inputs" side of
+// this graph: a register's Q for this iteration is derived from state captured at the
+// last clock edge, not from this iteration's D, so nothing needs D to be scheduled
+// before the register runs, and the register itself doesn't need to run late to see a
+// correct D - memory.js's holdEdgeOpen/stableAcrossIterations retry machinery already
+// tolerates D arriving on a later iteration. This matters because register-file style
+// circuits are routinely cyclic on paper (Rn.Q feeds a shared bus mux, which feeds
+// every register's D, including Rn's own, regardless of which register is currently
+// selected as source) even though no real combinational loop exists at runtime. Without
+// this exclusion, that structural cycle would drag every component on the bus (the mux,
+// and all registers sharing it) into the unsortable "remaining" bucket below, falling
+// back to raw array order and reintroducing the exact ordering-dependent floating/stale
+// read problem this function exists to eliminate - for every register on that bus, not
+// just the cyclic one.
+//
+// Any dependency edge that isn't broken this way and is still part of a genuine cycle
+// (e.g. a real combinational feedback loop) can't be linearized; those components are
+// appended in their original relative order and resolved by the outer iterate-to-
+// fixed-point loop in settleCircuit, same as before.
 function computeEvalOrder(plan) {
   const producerOf = new Map(); // wireId -> index into `plan`
   plan.forEach((p, i) => {
@@ -26,6 +54,7 @@ function computeEvalOrder(plan) {
   const indeg = new Array(plan.length).fill(0);
   const adj = Array.from({ length: plan.length }, () => []);
   plan.forEach((p, i) => {
+    if (isClocked(p.def, p.inst.params)) return; // don't gate a clocked component on its own inputs
     for (const ip of p.inPins) {
       if (ip.wireId == null) continue;
       const srcIdx = producerOf.get(ip.wireId);
