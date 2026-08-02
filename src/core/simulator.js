@@ -3,12 +3,61 @@ import { makeFloating, combineBits } from './bits.js';
 
 let globalCallCounter = 0;
 
+// Topologically sorts `plan` so that, within a single iteration of the settle loop,
+// a component runs after every component that feeds one of its inputs (when that's
+// possible - i.e. wherever the dependency graph isn't cyclic). This is what makes
+// combinational chains (incrementer -> mux -> register D, etc.) converge in O(depth)
+// iterations instead of O(2*depth) or worse: previously `plan` was evaluated in raw
+// circuit.components order, so a consumer could easily run before its producer in the
+// *same* pass, see a floating/stale input, and have to wait for a whole extra
+// iteration (or two, with the memory.js two-read staleness guard) to pick up the real
+// value. Genuine cycles (real combinational loops, or the intentional feedback loop
+// through a register's own Q -> ... -> D path) can't be linearized - those components
+// are appended in their original relative order and still resolved by the outer
+// iterate-to-fixed-point loop in settleCircuit, exactly as before.
+function computeEvalOrder(plan) {
+  const producerOf = new Map(); // wireId -> index into `plan`
+  plan.forEach((p, i) => {
+    for (const op of p.outPins) {
+      for (const wireId of op.targetWires) producerOf.set(wireId, i);
+    }
+  });
+
+  const indeg = new Array(plan.length).fill(0);
+  const adj = Array.from({ length: plan.length }, () => []);
+  plan.forEach((p, i) => {
+    for (const ip of p.inPins) {
+      if (ip.wireId == null) continue;
+      const srcIdx = producerOf.get(ip.wireId);
+      if (srcIdx == null || srcIdx === i) continue; // no producer, or self-loop: skip
+      adj[srcIdx].push(i);
+      indeg[i]++;
+    }
+  });
+
+  const order = [];
+  const queue = [];
+  indeg.forEach((d, i) => { if (d === 0) queue.push(i); });
+  const remaining = new Set(plan.map((_, i) => i));
+  let qi = 0;
+  while (qi < queue.length) {
+    const i = queue[qi++];
+    order.push(i);
+    remaining.delete(i);
+    for (const j of adj[i]) { if (--indeg[j] === 0) queue.push(j); }
+  }
+  // Anything left over sits on a real cycle. Keep original relative order for those -
+  // the outer iteration loop in settleCircuit resolves cycles across passes.
+  for (const i of plan.keys()) { if (remaining.has(i)) order.push(i); }
+
+  return order.map((i) => plan[i]);
+}
+
 export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 48 } = {}) {
   const callId = ++globalCallCounter;
   const wireValues = new Map();
   const instanceOutputs = new Map();
   let stable = false;
-
   const callStartState = new Map(circuit.components.map((inst) => [inst.id, inst.state]));
 
   // Precompute everything constant across iterations once, instead of every iteration.
@@ -37,13 +86,14 @@ export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 
     });
   }
 
+  // Evaluate in dependency order within each iteration - see computeEvalOrder above.
+  const orderedPlan = computeEvalOrder(plan);
+
   const tunnelInPlan = plan.filter((p) => p.def?.isTunnel === 'in');
   const tunnelOutPlan = plan.filter((p) => p.def?.isTunnel === 'out');
-
   let prevWireValues = null;
-
   for (let iter = 0; iter < maxIters; iter++) {
-    for (const { inst, def, inPins, outPins, injected, callStartState: css } of plan) {
+    for (const { inst, def, inPins, outPins, injected, callStartState: css } of orderedPlan) {
       const inputs = {};
       for (const p of inPins) {
         inputs[p.id] = p.wireId && wireValues.has(p.wireId) ? wireValues.get(p.wireId) : makeFloating(p.width);
@@ -60,7 +110,6 @@ export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 
         for (const wireId of p.targetWires) wireValues.set(wireId, val);
       }
     }
-
     const nets = new Map();
     for (const { inst } of tunnelInPlan) {
       const val = inst.state?.last;
@@ -75,11 +124,9 @@ export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 
       inst.state = { ...inst.state, injected: val };
       for (const w of circuit.wiresFrom(inst.id, 'out')) wireValues.set(w.id, val);
     }
-
     if (prevWireValues && wireValuesEqual(prevWireValues, wireValues)) { stable = true; break; }
     prevWireValues = new Map(wireValues);
   }
-
   return { wireValues, instanceOutputs, stable };
 }
 
