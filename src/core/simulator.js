@@ -15,35 +15,41 @@ function isClocked(def, params) {
 }
 
 // Topologically sorts `plan` so that, within a single iteration of the settle loop,
-// a component runs after every component that feeds one of its inputs (when that's
-// possible - i.e. wherever the dependency graph isn't cyclic). This is what makes
-// combinational chains (incrementer -> mux -> register D, etc.) converge in O(depth)
-// iterations instead of O(2*depth) or worse: previously `plan` was evaluated in raw
-// circuit.components order, so a consumer could easily run before its producer in the
-// *same* pass, see a floating/stale input, and have to wait for a whole extra
+// a component runs after every component that feeds one of its inputs, wherever that's
+// actually possible. This is what makes combinational chains (incrementer -> mux ->
+// register D, etc.) converge in O(depth) iterations instead of O(2*depth) or worse:
+// evaluating in raw circuit.components order lets a consumer run before its producer in
+// the *same* pass, forcing it to see a floating/stale input and burn a whole extra
 // iteration (or two, with the memory.js two-read staleness guard) to pick up the real
 // value.
 //
-// Clocked components are deliberately excluded from the "wait for my inputs" side of
-// this graph: a register's Q for this iteration is derived from state captured at the
-// last clock edge, not from this iteration's D, so nothing needs D to be scheduled
-// before the register runs, and the register itself doesn't need to run late to see a
-// correct D - memory.js's holdEdgeOpen/stableAcrossIterations retry machinery already
-// tolerates D arriving on a later iteration. This matters because register-file style
-// circuits are routinely cyclic on paper (Rn.Q feeds a shared bus mux, which feeds
-// every register's D, including Rn's own, regardless of which register is currently
-// selected as source) even though no real combinational loop exists at runtime. Without
-// this exclusion, that structural cycle would drag every component on the bus (the mux,
-// and all registers sharing it) into the unsortable "remaining" bucket below, falling
-// back to raw array order and reintroducing the exact ordering-dependent floating/stale
-// read problem this function exists to eliminate - for every register on that bus, not
-// just the cyclic one.
+// Real dependency cycles can't be linearized. Two kinds show up in practice:
+//   - A genuine combinational feedback loop (rare, usually a design error) - nothing
+//     can be done about this at the ordering level; it's left to the outer
+//     iterate-to-fixed-point loop in settleCircuit.
+//   - A *structural* cycle through a clocked component - e.g. a register file where
+//     every register's Q feeds a shared bus mux, which feeds every register's D,
+//     including that register's own, regardless of which register is currently
+//     selected as the source (Rn.Q -> mux -> Rn.D), or a program counter feeding its
+//     own D through an incrementer (PC.Q -> INC -> PC.D). This isn't a real
+//     combinational loop: a clocked component's Q for a given pass comes from state
+//     captured at the last clock edge, not from this pass's D, so it doesn't need to
+//     wait on D at all - memory.js's holdEdgeOpen/stableAcrossIterations retry
+//     machinery already tolerates D settling on a later iteration.
 //
-// Any dependency edge that isn't broken this way and is still part of a genuine cycle
-// (e.g. a real combinational feedback loop) can't be linearized; those components are
-// appended in their original relative order and resolved by the outer iterate-to-
-// fixed-point loop in settleCircuit, same as before.
+// The important part is that this only cuts the specific edge(s) actually closing a
+// cycle, and only once the algorithm is genuinely stuck - not every incoming edge of
+// every clocked component. Cutting indiscriminately (an earlier version of this
+// function did that) throws away real, non-cyclic ordering info too - e.g. a
+// register's EN coming from a decoder that isn't part of any cycle - and forces every
+// clocked component to always run first regardless of its actual dependencies. That
+// in turn desyncs settleCircuit's wire-value-based stability check from what's
+// actually happening inside the component (whose write decision depends on internal
+// pending-value state the wire snapshot can't see), and the loop can terminate one
+// iteration before the write it was building up to actually happens - silently
+// dropping the write entirely.
 function computeEvalOrder(plan) {
+  const n = plan.length;
   const producerOf = new Map(); // wireId -> index into `plan`
   plan.forEach((p, i) => {
     for (const op of p.outPins) {
@@ -51,33 +57,48 @@ function computeEvalOrder(plan) {
     }
   });
 
-  const indeg = new Array(plan.length).fill(0);
-  const adj = Array.from({ length: plan.length }, () => []);
+  // deps[i] = set of plan-indices that must be evaluated before component i.
+  const deps = plan.map(() => new Set());
   plan.forEach((p, i) => {
-    if (isClocked(p.def, p.inst.params)) return; // don't gate a clocked component on its own inputs
     for (const ip of p.inPins) {
       if (ip.wireId == null) continue;
       const srcIdx = producerOf.get(ip.wireId);
-      if (srcIdx == null || srcIdx === i) continue; // no producer, or self-loop: skip
-      adj[srcIdx].push(i);
-      indeg[i]++;
+      if (srcIdx == null || srcIdx === i) continue; // no producer, or self-loop: ignore
+      deps[i].add(srcIdx);
     }
   });
 
+  const done = new Array(n).fill(false);
   const order = [];
-  const queue = [];
-  indeg.forEach((d, i) => { if (d === 0) queue.push(i); });
-  const remaining = new Set(plan.map((_, i) => i));
-  let qi = 0;
-  while (qi < queue.length) {
-    const i = queue[qi++];
-    order.push(i);
-    remaining.delete(i);
-    for (const j of adj[i]) { if (--indeg[j] === 0) queue.push(j); }
+  let remainingCount = n;
+
+  while (remainingCount > 0) {
+    let progressed = false;
+    for (let i = 0; i < n; i++) {
+      if (done[i]) continue;
+      let ready = true;
+      for (const d of deps[i]) { if (!done[d]) { ready = false; break; } }
+      if (ready) { done[i] = true; order.push(i); remainingCount--; progressed = true; }
+    }
+    if (progressed) continue; // more nodes may now be ready; rescan before giving up
+
+    // Stuck: every remaining component is waiting on something that's waiting on it
+    // (a cycle). Prefer to break at a clocked component - drop just its still-pending
+    // incoming edges (the ones actually closing the cycle) so it can proceed without
+    // this pass's data; a later iteration of the outer settle loop supplies it once
+    // upstream has genuinely settled. Only fall back to breaking at an arbitrary
+    // (original-array-order) component if nothing remaining is clocked, i.e. it's a
+    // true combinational loop.
+    let breakAt = -1;
+    for (let i = 0; i < n; i++) {
+      if (!done[i] && isClocked(plan[i].def, plan[i].inst.params)) { breakAt = i; break; }
+    }
+    if (breakAt === -1) {
+      for (let i = 0; i < n; i++) { if (!done[i]) { breakAt = i; break; } }
+    }
+    deps[breakAt].clear();
+    done[breakAt] = true; order.push(breakAt); remainingCount--;
   }
-  // Anything left over sits on a real cycle. Keep original relative order for those -
-  // the outer iteration loop in settleCircuit resolves cycles across passes.
-  for (const i of plan.keys()) { if (remaining.has(i)) order.push(i); }
 
   return order.map((i) => plan[i]);
 }
