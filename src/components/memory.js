@@ -58,8 +58,50 @@ function consumeRisingEdge(state, callStartState, clk, callId) {
 // floating (data source not yet evaluated this pass). Keeps the edge available so a
 // later iteration within the same settleCircuit() call can gate/sample the settled
 // values instead of permanently losing the write.
+//
+// Also resets prevClk to 0. Within the current call this has no effect (baselineLow
+// is computed from callStartState, captured once before the call began, not from the
+// live state), but it matters for the *next* settleCircuit() call: if this edge
+// never actually got consumed by the time this call ends (e.g. upstream logic took
+// longer to converge than this call's iteration budget), we do NOT want the next
+// call to think it already saw clk's high plateau and refuse to retry. Leaving
+// prevClk at 0 lets a still-unconsumed edge keep being retried across multiple
+// separate settleCircuit() calls, for as long as clk keeps reading 1, until it's
+// either genuinely written or clk actually falls back to 0.
 function holdEdgeOpen(meta) {
   meta._edgeConsumed = false;
+  meta.prevClk = 0;
+}
+
+// Wires are NOT reset to floating between settleCircuit() calls - a pin keeps
+// whatever value it last resolved to. That means on the very first iteration of a
+// NEW call, a component sitting downstream of a mux (or any component whose output
+// depends on a select/control line that hasn't been re-evaluated yet this pass) can
+// read a fully valid, non-floating value that is nonetheless STALE - the mux's
+// output from *last* call, before its select line updated to reflect this call's new
+// value. That's indistinguishable from a "real" value by looking at floating-ness
+// alone, so the earlier floating-only check isn't enough to protect against it.
+//
+// The fix: don't trust a non-floating sample until it has read identically on two
+// consecutive iterations of the SAME call. A stale value gets overwritten by the
+// real one within a couple of iterations once its upstream (e.g. the mux) re-runs
+// this call, so the comparison will fail and correctly keep the edge open; a value
+// that was already correct on iteration 1 just costs one extra iteration to confirm.
+// `value` must already be a reduced, comparable primitive (a number from toInt(), or
+// a 0/1/FLOATING bit) - never compare raw bit arrays here.
+function stableAcrossIterations(value, state, meta, callId, key) {
+  const pendingKey = '_pending_' + key;
+  const pendingCallKey = '_pendingCall_' + key;
+  const isSameCall = state[pendingCallKey] === callId;
+  const matched = isSameCall && state[pendingKey] === value;
+  if (matched) {
+    meta[pendingKey] = undefined;
+    meta[pendingCallKey] = undefined;
+  } else {
+    meta[pendingKey] = value;
+    meta[pendingCallKey] = callId;
+  }
+  return matched;
 }
 
 registerComponentType({
@@ -96,10 +138,19 @@ registerComponentType({
       } else if (s === FLOATING || r === FLOATING) {
         holdEdgeOpen(meta); // s/r not settled yet this pass - try again next iteration
       } else {
-        const sv = s === 1, rv = r === 1;
-        if (sv && rv) conflict = true;
-        else if (sv) q = 1;
-        else if (rv) q = 0;
+        const sStable = stableAcrossIterations(s, state, meta, callId, 's');
+        const rStable = stableAcrossIterations(r, state, meta, callId, 'r');
+        if (!sStable || !rStable) {
+          // s/r are non-floating but may still be a stale value carried over from
+          // before this call (e.g. from an upstream mux whose select hasn't been
+          // re-evaluated yet) - wait for them to read the same value twice in a row.
+          holdEdgeOpen(meta);
+        } else {
+          const sv = s === 1, rv = r === 1;
+          if (sv && rv) conflict = true;
+          else if (sv) q = 1;
+          else if (rv) q = 0;
+        }
       }
     }
     const qOut = conflict ? CONFLICT : q;
@@ -146,10 +197,18 @@ registerComponentType({
       } else if (j === FLOATING || k === FLOATING) {
         holdEdgeOpen(meta); // j/k not settled yet this pass - try again next iteration
       } else {
-        const jv = j === 1, kv = k === 1;
-        if (jv && kv) q = q ? 0 : 1;
-        else if (jv) q = 1;
-        else if (kv) q = 0;
+        const jStable = stableAcrossIterations(j, state, meta, callId, 'j');
+        const kStable = stableAcrossIterations(k, state, meta, callId, 'k');
+        if (!jStable || !kStable) {
+          // j/k are non-floating but may still be stale from before this call -
+          // wait for them to read the same value twice in a row.
+          holdEdgeOpen(meta);
+        } else {
+          const jv = j === 1, kv = k === 1;
+          if (jv && kv) q = q ? 0 : 1;
+          else if (jv) q = 1;
+          else if (kv) q = 0;
+        }
       }
     }
     return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, ...meta } };
@@ -189,10 +248,15 @@ registerComponentType({
     } else if (rising) {
       if (en !== 1) {
         holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
-      } else if (d === 0 || d === 1) {
-        q = d;
-      } else {
+      } else if (d !== 0 && d !== 1) {
         holdEdgeOpen(meta); // d not settled yet this pass - try again next iteration
+      } else if (!stableAcrossIterations(d, state, meta, callId, 'd')) {
+        // d is non-floating but may still be a stale value carried over from before
+        // this call (e.g. from an upstream mux whose select hasn't been
+        // re-evaluated yet) - wait for it to read the same value twice in a row.
+        holdEdgeOpen(meta);
+      } else {
+        q = d;
       }
     }
     return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, ...meta } };
@@ -239,13 +303,22 @@ registerComponentType({
       } else {
         const dBits = inputs.d || new Array(width).fill(FLOATING);
         const v = toInt(dBits);
-        if (v !== null) {
-          value = v;
-        } else {
+        if (v === null) {
           // d hasn't settled yet this pass (e.g. its source component runs later in
           // this settleCircuit() call) - don't burn the edge, try again next iteration
           // once d has a real value.
           holdEdgeOpen(meta);
+        } else if (!stableAcrossIterations(v, state, meta, callId, 'd')) {
+          // d is non-floating, but wires don't reset to floating between calls, so
+          // this could be a STALE value left over from before this call (e.g. an
+          // upstream mux whose select line hasn't been re-evaluated yet this pass,
+          // still outputting last call's result - which can easily equal this
+          // register's own current value via a feedback path, making it *look*
+          // like nothing happened). Only trust it once it reads the same twice in a
+          // row within this call.
+          holdEdgeOpen(meta);
+        } else {
+          value = v;
         }
       }
     }
@@ -308,13 +381,17 @@ registerComponentType({
       } else {
         const dinBits = inputs.din || new Array(dataWidth).fill(FLOATING);
         const v = toInt(dinBits);
-        if (v !== null) {
-          mem = mem.slice();
-          mem[addr % size] = v;
-        } else {
+        if (v === null) {
           // din (or addr) not settled yet this pass - try again next iteration
           // instead of permanently losing this write.
           holdEdgeOpen(meta);
+        } else if (!stableAcrossIterations(v, state, meta, callId, 'din')) {
+          // din is non-floating but may be a stale value from before this call
+          // (e.g. an upstream mux mid-reconverging) - confirm it repeats first.
+          holdEdgeOpen(meta);
+        } else {
+          mem = mem.slice();
+          mem[addr % size] = v;
         }
       }
     }
@@ -506,12 +583,16 @@ registerComponentType({
       } else if (ld === 1) {
         const dBits = inputs.d || new Array(width).fill(FLOATING);
         const v = toInt(dBits);
-        if (v !== null) {
-          value = v;
-        } else {
+        if (v === null) {
           // d not settled yet this pass - try again next iteration instead of
           // permanently losing this load.
           holdEdgeOpen(meta);
+        } else if (!stableAcrossIterations(v, state, meta, callId, 'd')) {
+          // d is non-floating but may be a stale value from before this call
+          // (e.g. an upstream mux mid-reconverging) - confirm it repeats first.
+          holdEdgeOpen(meta);
+        } else {
+          value = v;
         }
       } else if (dir === 'left') {
         soutBit = (value >> (width - 1)) & 1;
