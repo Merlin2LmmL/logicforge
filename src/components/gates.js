@@ -103,7 +103,7 @@ registerComponentType({
   color: '#7fd67f',
   paramsSchema: [
     { key: 'width', label: 'Bitbreite', kind: 'int', min: 1, max: 32, step: 1, default: 1 },
-    { key: 'delayMs', label: 'Verzögerung (ms)', kind: 'int', min: 0, max: 60000, step: 1, default: 0 },
+    { key: 'delayTicks', label: 'Verzögerung (Takte)', kind: 'int', min: 0, max: 1000, step: 1, default: 0 },
   ],
   pins: (params) => [
     { id: 'in0', label: 'A', dir: 'in', width: params.width ?? 1, side: 'left', order: 0 },
@@ -111,39 +111,45 @@ registerComponentType({
   ],
   size: () => ({ w: 3, h: 2 }),
   init: () => ({ queue: [] }),
-  evaluate: ({ inputs, params, state, now }) => {
-  const width = params.width ?? 1;
-  const delayMs = params.delayMs ?? 0;
-  const a = inputs.in0 || new Array(width).fill(FLOATING);
+  evaluate: ({ inputs, params, state, callId }) => {
+    const width = params.width ?? 1;
+    const delayTicks = params.delayTicks ?? 0;
+    const a = inputs.in0 || new Array(width).fill(FLOATING);
 
-  if (delayMs <= 0) {
-    return { outputs: { out: a.slice() }, state: { queue: [] } };
-  }
+    if (delayTicks <= 0) {
+      return { outputs: { out: a.slice() }, state: { queue: [] } };
+    }
 
-  const queue = state?.queue || [];
-  const last = queue[queue.length - 1];
-  // Only append when the value differs from what's already queued, or the queue
-  // is empty. Prevents growing by up to maxIters entries within a single
-  // settleCircuit() call, where `now` is constant across all iterations.
-  const newQueue = (!last || !equalBits(last.value, a))
-    ? queue.concat([{ t: now, value: a.slice() }])
-    : queue;
+    const queue = state?.queue || [];
+    const last = queue[queue.length - 1];
+    // Only append when the value differs from what's already queued, or the queue
+    // is empty. Prevents growing by up to maxIters entries within a single
+    // settleCircuit() call, where `callId` is constant across all iterations of
+    // that call - so multiple appends here just represent this call's convergence
+    // toward its final value, and the last one appended always wins once matured.
+    const newQueue = (!last || !equalBits(last.value, a))
+      ? queue.concat([{ tick: callId, value: a.slice() }])
+      : queue;
 
-  let outValue = new Array(width).fill(FLOATING);
-  let cutoffIndex = -1;
-  for (let i = 0; i < newQueue.length; i++) {
-    if (newQueue[i].t <= now - delayMs) {
-      outValue = newQueue[i].value;
-      cutoffIndex = i;
-    } else break;
-  }
-  const trimmed = cutoffIndex > 0 ? newQueue.slice(cutoffIndex) : newQueue;
-  return { outputs: { out: outValue.slice() }, state: { queue: trimmed } };
-},
+    let outValue = new Array(width).fill(FLOATING);
+    let cutoffIndex = -1;
+    for (let i = 0; i < newQueue.length; i++) {
+      // "Matured" means at least delayTicks separate settleCircuit() calls have
+      // happened since this value was queued - guaranteed to eventually become
+      // true as long as the simulation keeps ticking at all, regardless of real
+      // elapsed wall-clock time.
+      if (newQueue[i].tick <= callId - delayTicks) {
+        outValue = newQueue[i].value;
+        cutoffIndex = i;
+      } else break;
+    }
+    const trimmed = cutoffIndex > 0 ? newQueue.slice(cutoffIndex) : newQueue;
+    return { outputs: { out: outValue.slice() }, state: { queue: trimmed } };
+  },
   help: {
-    summary: 'Signalpuffer: gibt den Eingang unverändert weiter, optional zeitlich verzögert.',
-    usage: 'Nützlich, um Signale sauber umzuleiten/aufzuteilen, als Platzhalter für spätere Logik, oder um eine reale Signallaufzeit (ms) zu simulieren.',
-    pins: { in0: 'Eingangssignal.', out: 'Signal wie in0, um delayMs (ms) verzögert.' },
+    summary: 'Signalpuffer: gibt den Eingang unverändert weiter, optional verzögert um eine bestimmte Anzahl an Simulationstakten.',
+    usage: 'Nützlich, um Signale sauber umzuleiten/aufzuteilen, als Platzhalter für spätere Logik, oder um eine Signallaufzeit zu simulieren. Die Verzögerung zählt Simulationsdurchläufe (Takte), nicht reale Millisekunden - dadurch bleibt sie unabhängig davon, ob und wie oft die Schaltung sonst gerade neu ausgewertet wird.',
+    pins: { in0: 'Eingangssignal.', out: 'Signal wie in0, um delayTicks Simulationstakte verzögert.' },
   },
 });
 
