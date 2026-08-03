@@ -17,6 +17,16 @@ function snapshotState(state) {
 }
 
 export function settleCircuit(circuit, { forcedInputs = {}, now = 0, maxIters = 200 } = {}) {
+  // Clamp to a safe floor regardless of what the caller passes. A caller-supplied
+  // maxIters always overrides this function's default parameter in JS - so if some
+  // call site still has an old, smaller value hardcoded (e.g. left over from before
+  // deeper combinational chains like ALU -> MUX -> MUX -> register existed), that
+  // value would silently starve convergence on any circuit deep enough to need more
+  // iterations, with no error - just a write that never lands. Floor it here so
+  // correctness doesn't depend on every caller staying in sync with how deep
+  // circuits people actually build get.
+  maxIters = Math.max(maxIters, 200);
+
   const callId = ++globalCallCounter;
   const wireValues = new Map();
   const instanceOutputs = new Map();
