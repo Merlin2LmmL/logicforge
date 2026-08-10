@@ -119,21 +119,29 @@ registerComponentType({
   ],
   pins: () => [{ id: 'out', label: '', dir: 'out', width: 1, side: 'right', order: 0 }],
   size: () => ({ w: 2, h: 2 }),
-  init: () => ({ armed: false, _callRef: null, _pulsedThisArm: false }),
+  // `armed` means "a click is waiting to be delivered as a pulse". `firing` means
+  // "this is the one tick where out=1" - it's set the tick after arming and cleared
+  // the tick after that, so the pulse is visible for exactly one full settleCircuit()
+  // call (one full Phase A/B pass) regardless of dependency order, then goes away on
+  // its own without needing any "was this the same call as before" bookkeeping.
+  init: () => ({ armed: false, firing: false }),
   interactive: true,
   onActivate: (state, params) => {
     if ((params?.hz ?? 0) > 0) return state;
-    return state.armed ? state : { ...state, armed: true, _pulsedThisArm: false };
+    return state.armed || state.firing ? state : { ...state, armed: true };
   },
-  evaluate: ({ state, params, now, callId }) => {
+  evaluate: ({ state, params, now }) => {
   const hz = params.hz ?? 0;
     if (hz <= 0) {
-      if (!state.armed) return { outputs: { out: [0] }, state };
-      const isNewCall = state._callId !== callId;
-      if (isNewCall && state._pulsedThisArm) {
-        return { outputs: { out: [0] }, state: { armed: false, _callId: callId, _pulsedThisArm: false } };
-      }
-      return { outputs: { out: [1] }, state: { armed: true, _callId: callId, _pulsedThisArm: true } };
+      // Each settleCircuit() call now evaluates this node exactly once (no repeated
+      // sweeps - see simulator.js), so a plain two-state latch is enough: the click
+      // arms it, the very next evaluate() call turns that into a one-tick pulse, and
+      // the call after that clears it back to 0. No callId/isNewCall comparison
+      // needed, since there's no longer more than one evaluate() per tick to
+      // disambiguate.
+      if (state.firing) return { outputs: { out: [0] }, state: { armed: false, firing: false } };
+      if (state.armed) return { outputs: { out: [1] }, state: { armed: false, firing: true } };
+      return { outputs: { out: [0] }, state };
     }
     // Automatischer Modus: `now` ist über den gesamten Aufruf konstant, daher betrifft
     // dieses Problem hier nicht - `elapsed === 0` ist entweder in JEDER Iteration wahr
