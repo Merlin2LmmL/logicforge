@@ -1,5 +1,5 @@
 import { registerComponentType } from '../core/registry.js';
-import { FLOATING, CONFLICT, equalBits } from '../core/bits.js';
+import { FLOATING, CONFLICT } from '../core/bits.js';
 
 function bitwiseGate(inputsArr, width, op, identity) {
   const out = new Array(width);
@@ -111,7 +111,13 @@ registerComponentType({
   ],
   size: () => ({ w: 3, h: 2 }),
   init: () => ({ queue: [] }),
-  evaluate: ({ inputs, params, state, callId }) => {
+  // Delay-by-ticks history buffer. simulator.js now calls evaluate() exactly once
+  // per component per settleCircuit() call (no repeated sweeps - see simulator.js),
+  // so "how many ticks has this value been queued" is just "how many entries are
+  // ahead of it in the queue" - no callId stamping/comparison needed at all, which
+  // is what broke this under the old callId scheme (callId no longer exists; the
+  // maturity check always evaluated to false, so out never advanced past FLOATING).
+  evaluate: ({ inputs, params, state }) => {
     const width = params.width ?? 1;
     const delayTicks = params.delayTicks ?? 0;
     const a = inputs.in0 || new Array(width).fill(FLOATING);
@@ -120,31 +126,18 @@ registerComponentType({
       return { outputs: { out: a.slice() }, state: { queue: [] } };
     }
 
-    const queue = state?.queue || [];
-    const last = queue[queue.length - 1];
-    // Only append when the value differs from what's already queued, or the queue
-    // is empty. Prevents growing by up to maxIters entries within a single
-    // settleCircuit() call, where `callId` is constant across all iterations of
-    // that call - so multiple appends here just represent this call's convergence
-    // toward its final value, and the last one appended always wins once matured.
-    const newQueue = (!last || !equalBits(last.value, a))
-      ? queue.concat([{ tick: callId, value: a.slice() }])
-      : queue;
-
+    // Push this tick's sample, then emit the oldest sample once the queue holds
+    // more than delayTicks entries (i.e. it has waited delayTicks full ticks).
+    // Until the queue fills up (e.g. right after changing delayTicks upward, or
+    // right after a reset), output stays FLOATING - there's genuinely no sample
+    // from delayTicks ticks ago yet.
+    const queue = (state?.queue || []).concat([a.slice()]);
     let outValue = new Array(width).fill(FLOATING);
-    let cutoffIndex = -1;
-    for (let i = 0; i < newQueue.length; i++) {
-      // "Matured" means at least delayTicks separate settleCircuit() calls have
-      // happened since this value was queued - guaranteed to eventually become
-      // true as long as the simulation keeps ticking at all, regardless of real
-      // elapsed wall-clock time.
-      if (newQueue[i].tick <= callId - delayTicks) {
-        outValue = newQueue[i].value;
-        cutoffIndex = i;
-      } else break;
+    if (queue.length > delayTicks) {
+      outValue = queue[0];
+      queue.shift();
     }
-    const trimmed = cutoffIndex > 0 ? newQueue.slice(cutoffIndex) : newQueue;
-    return { outputs: { out: outValue.slice() }, state: { queue: trimmed } };
+    return { outputs: { out: outValue.slice() }, state: { queue } };
   },
   help: {
     summary: 'Signalpuffer: gibt den Eingang unverändert weiter, optional verzögert um eine bestimmte Anzahl an Simulationstakten.',
