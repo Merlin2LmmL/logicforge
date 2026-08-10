@@ -1,6 +1,15 @@
 import { registerComponentType } from '../core/registry.js';
 import { FLOATING, CONFLICT } from '../core/bits.js';
 
+// True if `v` looks like a bit-array value (what every pin's inputs/outputs are
+// shaped as), as opposed to some other/older/corrupt state shape. Used to filter
+// out stale saved state from before a component's persisted-state shape changed,
+// so an old project can be opened without evaluate() crashing on unexpected data.
+function isBitArray(v) {
+  return Array.isArray(v) && v.every((b) => b === 0 || b === 1 || b === FLOATING || b === CONFLICT);
+}
+
+
 function bitwiseGate(inputsArr, width, op, identity) {
   const out = new Array(width);
   for (let i = 0; i < width; i++) {
@@ -117,6 +126,14 @@ registerComponentType({
   // ahead of it in the queue" - no callId stamping/comparison needed at all, which
   // is what broke this under the old callId scheme (callId no longer exists; the
   // maturity check always evaluated to false, so out never advanced past FLOATING).
+  //
+  // Defensive note: state is deserialized as-is from old saves (.lgf files,
+  // autosave) with NO migration step - a project saved before this rewrite can
+  // still have the OLD queue shape, entries like { tick, value } instead of plain
+  // bit-arrays. isBitArray() below guards against that: an old-shaped/corrupt
+  // entry is treated as if it were never queued (dropped), rather than handed to
+  // .slice() and crashing (which is what happened before this guard - "queue[0]"
+  // could be an old {tick,value} object, and object.slice() throws).
   evaluate: ({ inputs, params, state }) => {
     const width = params.width ?? 1;
     const delayTicks = params.delayTicks ?? 0;
@@ -126,12 +143,8 @@ registerComponentType({
       return { outputs: { out: a.slice() }, state: { queue: [] } };
     }
 
-    // Push this tick's sample, then emit the oldest sample once the queue holds
-    // more than delayTicks entries (i.e. it has waited delayTicks full ticks).
-    // Until the queue fills up (e.g. right after changing delayTicks upward, or
-    // right after a reset), output stays FLOATING - there's genuinely no sample
-    // from delayTicks ticks ago yet.
-    const queue = (state?.queue || []).concat([a.slice()]);
+    const rawQueue = Array.isArray(state?.queue) ? state.queue : [];
+    const queue = rawQueue.filter(isBitArray).concat([a.slice()]);
     let outValue = new Array(width).fill(FLOATING);
     if (queue.length > delayTicks) {
       outValue = queue[0];
