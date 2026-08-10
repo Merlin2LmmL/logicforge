@@ -5,103 +5,23 @@ function bit1(v) { return v === 1 ? 1 : v === 0 ? 0 : FLOATING; }
 // Control pins default to a sane value when left unconnected: enable=on, reset/clock=off.
 function ctrl(v, fallback) { return v === 1 || v === 0 ? v : fallback; }
 
-// Detects a rising edge exactly once per settleCircuit() call, no matter how many
-// iterations within that call see clk resolve to 1, and no matter which order
-// components are evaluated in (which previously made "how many times did this
-// component see clk=1 before the call settled" effectively random per component).
-// callId is a monotonically increasing integer minted once per settleCircuit() call
-// (see simulator.js) and passed through evaluate() - comparing against it (not an
-// object reference, which can be ambiguous across sub-stepped/cloned state) tells us
-// whether we're still inside the same call (further clk=1 iterations are the same
-// edge, already consumed) or a new call has started (a fresh edge is possible again).
+// Edge detection for clocked (isSequential: true) components.
 //
-// IMPORTANT - "hold open" for not-yet-settled gating/data:
-// settleCircuit() runs the full component list once per iteration, in plain array
-// order (not topologically sorted - see simulator.js). That means on the very first
-// iteration where this component's clk input happens to already read 1, an upstream
-// component that drives this component's *data* input (d / din / bus, ...) - or its
-// *enable* input (en / we) - may not have run yet this pass, so those inputs can
-// still read as floating, or even as a stale resolved 0, even though the circuit as
-// a whole will converge to the real, stable values a few iterations later within the
-// same settleCircuit() call.
+// simulator.js now schedules combinational logic in dependency order (Phase A) and
+// only then evaluates every sequential component exactly once (Phase B), against
+// those fully-settled values. There is no repeated sweeping, no ambiguity about
+// whether an upstream mux/adder/etc. has "run yet this pass" - by construction it
+// already has, or this component wouldn't be in Phase B at all. So edge detection
+// is just the textbook one-liner: compare this tick's clk against last tick's clk,
+// stored in state.prevClk.
 //
-// Since a rising edge is normally a one-shot per call (_edgeConsumed latches true
-// forever once fired), sampling - or gating - on that too-early iteration would
-// permanently burn the edge with a floating/stale sample and never get a second
-// chance to read the real value later in the same call - even though clk never
-// actually toggled again.
-//
-// To fix this, every call site must treat `rising` as provisional: only leave
-// _edgeConsumed=true (i.e. actually let the edge "count") on the iteration where the
-// write genuinely happens. On every other iteration where `rising` was true but the
-// gating (en/we) hasn't resolved to 1 yet, or the sampled data is still floating,
-// callers must call holdEdgeOpen(meta). That clears _edgeConsumed (but leaves
-// prevClk updated to reflect clk's current value), so a later iteration in the same
-// settleCircuit() call - once upstream logic has settled - is allowed to detect the
-// rising edge again and sample/gate correctly. This is safe even when en/we
-// genuinely stays 0 for the whole clock pulse (no race at all): holding the edge
-// open doesn't affect prevClk, so once clk actually falls and rises again on a real
-// pulse, edge detection still behaves correctly next time.
-function consumeRisingEdge(state, callStartState, clk, callId) {
-  const isNewCall = state._callId !== callId;
-  const alreadyConsumed = !isNewCall && !!state._edgeConsumed;
-  const baselineLow = (callStartState ?? state).prevClk === 0;
-  const rising = !alreadyConsumed && baselineLow && clk === 1;
-  return {
-    rising,
-    meta: { _callId: callId, _edgeConsumed: alreadyConsumed || rising, prevClk: clk },
-  };
-}
-
-// Call when `rising` was true but this pass wasn't the real write - either the
-// gating input (en/we) hasn't resolved to 1 yet, or the sampled data is still
-// floating (data source not yet evaluated this pass). Keeps the edge available so a
-// later iteration within the same settleCircuit() call can gate/sample the settled
-// values instead of permanently losing the write.
-//
-// Also resets prevClk to 0. Within the current call this has no effect (baselineLow
-// is computed from callStartState, captured once before the call began, not from the
-// live state), but it matters for the *next* settleCircuit() call: if this edge
-// never actually got consumed by the time this call ends (e.g. upstream logic took
-// longer to converge than this call's iteration budget), we do NOT want the next
-// call to think it already saw clk's high plateau and refuse to retry. Leaving
-// prevClk at 0 lets a still-unconsumed edge keep being retried across multiple
-// separate settleCircuit() calls, for as long as clk keeps reading 1, until it's
-// either genuinely written or clk actually falls back to 0.
-function holdEdgeOpen(meta) {
-  meta._edgeConsumed = false;
-  meta.prevClk = 0;
-}
-
-// Wires are NOT reset to floating between settleCircuit() calls - a pin keeps
-// whatever value it last resolved to. That means on the very first iteration of a
-// NEW call, a component sitting downstream of a mux (or any component whose output
-// depends on a select/control line that hasn't been re-evaluated yet this pass) can
-// read a fully valid, non-floating value that is nonetheless STALE - the mux's
-// output from *last* call, before its select line updated to reflect this call's new
-// value. That's indistinguishable from a "real" value by looking at floating-ness
-// alone, so the earlier floating-only check isn't enough to protect against it.
-//
-// The fix: don't trust a non-floating sample until it has read identically on two
-// consecutive iterations of the SAME call. A stale value gets overwritten by the
-// real one within a couple of iterations once its upstream (e.g. the mux) re-runs
-// this call, so the comparison will fail and correctly keep the edge open; a value
-// that was already correct on iteration 1 just costs one extra iteration to confirm.
-// `value` must already be a reduced, comparable primitive (a number from toInt(), or
-// a 0/1/FLOATING bit) - never compare raw bit arrays here.
-function stableAcrossIterations(value, state, meta, callId, key) {
-  const pendingKey = '_pending_' + key;
-  const pendingCallKey = '_pendingCall_' + key;
-  const isSameCall = state[pendingCallKey] === callId;
-  const matched = isSameCall && state[pendingKey] === value;
-  if (matched) {
-    meta[pendingKey] = undefined;
-    meta[pendingCallKey] = undefined;
-  } else {
-    meta[pendingKey] = value;
-    meta[pendingCallKey] = callId;
-  }
-  return matched;
+// This replaces the old consumeRisingEdge/holdEdgeOpen/stableAcrossIterations
+// machinery, which existed only to compensate for the previous flat-sweep
+// scheduler's lack of ordering guarantees (see simulator.js history/comments).
+// None of that provisional "maybe this sample is stale, confirm it twice" logic is
+// needed anymore: inputs read in Phase B are final, not provisional.
+function risingEdge(state, clk) {
+  return (state.prevClk ?? 0) === 0 && clk === 1;
 }
 
 registerComponentType({
@@ -120,8 +40,9 @@ registerComponentType({
     { id: 'nq', label: 'Q̄', dir: 'out', width: 1, side: 'right', order: 1 },
   ],
   size: () => ({ w: 3, h: 4 }),
+  isSequential: true,
   init: () => ({ q: 0, prevClk: 0 }),
-  evaluate: ({ inputs, state, callStartState, callId }) => {
+  evaluate: ({ inputs, state }) => {
     const s = bit1(inputs.s?.[0]);
     const r = bit1(inputs.r?.[0]);
     const clk = ctrl(inputs.clk?.[0], 0);
@@ -129,33 +50,18 @@ registerComponentType({
     const rst = ctrl(inputs.rst?.[0], 0);
     let q = state.q ?? 0;
     let conflict = false;
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
+    const rising = risingEdge(state, clk);
     if (rst === 1) {
       q = 0;
-    } else if (rising) {
-      if (en !== 1) {
-        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
-      } else if (s === FLOATING || r === FLOATING) {
-        holdEdgeOpen(meta); // s/r not settled yet this pass - try again next iteration
-      } else {
-        const sStable = stableAcrossIterations(s, state, meta, callId, 's');
-        const rStable = stableAcrossIterations(r, state, meta, callId, 'r');
-        if (!sStable || !rStable) {
-          // s/r are non-floating but may still be a stale value carried over from
-          // before this call (e.g. from an upstream mux whose select hasn't been
-          // re-evaluated yet) - wait for them to read the same value twice in a row.
-          holdEdgeOpen(meta);
-        } else {
-          const sv = s === 1, rv = r === 1;
-          if (sv && rv) conflict = true;
-          else if (sv) q = 1;
-          else if (rv) q = 0;
-        }
-      }
+    } else if (rising && en === 1) {
+      const sv = s === 1, rv = r === 1;
+      if (sv && rv) conflict = true;
+      else if (sv) q = 1;
+      else if (rv) q = 0;
     }
     const qOut = conflict ? CONFLICT : q;
     const nqOut = conflict ? CONFLICT : (q ? 0 : 1);
-    return { outputs: { q: [qOut], nq: [nqOut] }, state: { q, ...meta } };
+    return { outputs: { q: [qOut], nq: [nqOut] }, state: { q, prevClk: clk } };
   },
   help: {
     summary: 'SR-Flipflop: Set/Reset-Speicher, taktflankengesteuert (wie DFF/Register). S=R=1 ist der klassische verbotene Zustand und wird als Konflikt (X) ausgegeben.',
@@ -180,38 +86,25 @@ registerComponentType({
     { id: 'nq', label: 'Q̄', dir: 'out', width: 1, side: 'right', order: 1 },
   ],
   size: () => ({ w: 3, h: 4 }),
+  isSequential: true,
   init: () => ({ q: 0, prevClk: 0 }),
-  evaluate: ({ inputs, state, callStartState, callId }) => {
+  evaluate: ({ inputs, state }) => {
     const j = bit1(inputs.j?.[0]);
     const k = bit1(inputs.k?.[0]);
     const clk = ctrl(inputs.clk?.[0], 0);
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let q = state.q ?? 0;
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
+    const rising = risingEdge(state, clk);
     if (rst === 1) {
       q = 0;
-    } else if (rising) {
-      if (en !== 1) {
-        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
-      } else if (j === FLOATING || k === FLOATING) {
-        holdEdgeOpen(meta); // j/k not settled yet this pass - try again next iteration
-      } else {
-        const jStable = stableAcrossIterations(j, state, meta, callId, 'j');
-        const kStable = stableAcrossIterations(k, state, meta, callId, 'k');
-        if (!jStable || !kStable) {
-          // j/k are non-floating but may still be stale from before this call -
-          // wait for them to read the same value twice in a row.
-          holdEdgeOpen(meta);
-        } else {
-          const jv = j === 1, kv = k === 1;
-          if (jv && kv) q = q ? 0 : 1;
-          else if (jv) q = 1;
-          else if (kv) q = 0;
-        }
-      }
+    } else if (rising && en === 1) {
+      const jv = j === 1, kv = k === 1;
+      if (jv && kv) q = q ? 0 : 1;
+      else if (jv) q = 1;
+      else if (kv) q = 0;
     }
-    return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, ...meta } };
+    return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, prevClk: clk } };
   },
   help: {
     summary: 'JK-Flipflop: wie SRFF, aber J=K=1 toggelt den Zustand statt einen verbotenen Zustand zu erzeugen.',
@@ -235,31 +128,21 @@ registerComponentType({
     { id: 'nq', label: 'Q̄', dir: 'out', width: 1, side: 'right', order: 1 },
   ],
   size: () => ({ w: 3, h: 4 }),
+  isSequential: true,
   init: () => ({ q: 0, prevClk: 0 }),
-  evaluate: ({ inputs, state, callStartState, callId }) => {
+  evaluate: ({ inputs, state }) => {
     const d = bit1(inputs.d?.[0]);
     const clk = ctrl(inputs.clk?.[0], 0);
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let q = state.q ?? 0;
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
+    const rising = risingEdge(state, clk);
     if (rst === 1) {
       q = 0;
-    } else if (rising) {
-      if (en !== 1) {
-        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
-      } else if (d !== 0 && d !== 1) {
-        holdEdgeOpen(meta); // d not settled yet this pass - try again next iteration
-      } else if (!stableAcrossIterations(d, state, meta, callId, 'd')) {
-        // d is non-floating but may still be a stale value carried over from before
-        // this call (e.g. from an upstream mux whose select hasn't been
-        // re-evaluated yet) - wait for it to read the same value twice in a row.
-        holdEdgeOpen(meta);
-      } else {
-        q = d;
-      }
+    } else if (rising && en === 1 && (d === 0 || d === 1)) {
+      q = d;
     }
-    return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, ...meta } };
+    return { outputs: { q: [q], nq: [q ? 0 : 1] }, state: { q, prevClk: clk } };
   },
   help: {
     summary: 'D-Flipflop: übernimmt bei jeder steigenden CLK-Flanke den Wert von D nach Q - der einfachste 1-Bit-Speicherbaustein.',
@@ -282,50 +165,28 @@ registerComponentType({
     { id: 'q', label: 'Q', dir: 'out', width: params.width ?? 8, side: 'right', order: 0 },
   ],
   size: (params) => ({ w: 4, h: Math.max(4, Math.ceil((params.width ?? 8) / 4) + 2) }),
+  isSequential: true,
   init: (params) => ({ value: 0, prevClk: 0, width: params.width ?? 8 }),
-  evaluate: ({ inputs, state, params, callStartState, callId }) => {
+  evaluate: ({ inputs, state, params }) => {
     const width = params.width ?? 8;
     const clk = ctrl(inputs.clk?.[0], 0);
     const en = ctrl(inputs.en?.[0], 1);
     const rst = ctrl(inputs.rst?.[0], 0);
     let value = state.value ?? 0;
 
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
+    const rising = risingEdge(state, clk);
 
     if (rst === 1) {
       value = 0;
-    } else if (rising) {
-      if (en !== 1) {
-        // en hasn't resolved to 1 yet this pass (e.g. its source component runs
-        // later in this settleCircuit() call) - don't burn the edge, try again
-        // next iteration once en has its real value.
-        holdEdgeOpen(meta);
-      } else {
-        const dBits = inputs.d || new Array(width).fill(FLOATING);
-        const v = toInt(dBits);
-        if (v === null) {
-          // d hasn't settled yet this pass (e.g. its source component runs later in
-          // this settleCircuit() call) - don't burn the edge, try again next iteration
-          // once d has a real value.
-          holdEdgeOpen(meta);
-        } else if (!stableAcrossIterations(v, state, meta, callId, 'd')) {
-          // d is non-floating, but wires don't reset to floating between calls, so
-          // this could be a STALE value left over from before this call (e.g. an
-          // upstream mux whose select line hasn't been re-evaluated yet this pass,
-          // still outputting last call's result - which can easily equal this
-          // register's own current value via a feedback path, making it *look*
-          // like nothing happened). Only trust it once it reads the same twice in a
-          // row within this call.
-          holdEdgeOpen(meta);
-        } else {
-          value = v;
-        }
-      }
+    } else if (rising && en === 1) {
+      const dBits = inputs.d || new Array(width).fill(FLOATING);
+      const v = toInt(dBits);
+      if (v !== null) value = v;
     }
 
     return {
       outputs: { q: fromInt(value, width) },
-      state: { value, width, ...meta },
+      state: { value, width, prevClk: clk },
     };
   },
   help: {
@@ -357,8 +218,9 @@ registerComponentType({
     { id: 'dout', label: 'DO', dir: 'out', width: params.dataWidth ?? 8, side: 'right', order: 0 },
   ],
   size: () => ({ w: 4, h: 7 }),
+  isSequential: true,
   init: (params) => ({ mem: presetToMem(params), prevClk: 0 }),
-  evaluate: ({ inputs, state, params, callStartState, callId }) => {
+  evaluate: ({ inputs, state, params }) => {
     const addrWidth = Math.min(params.addrWidth ?? 4, MAX_ADDR_BITS);
     const dataWidth = params.dataWidth ?? 8;
     const size = 2 ** addrWidth;
@@ -371,33 +233,18 @@ registerComponentType({
     const ce = ctrl(inputs.ce?.[0], 1);
     const cs = ctrl(inputs.cs?.[0], 1);
     const enabled = ce === 1 && cs === 1;
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
-    if (rising) {
-      if (we !== 1 || !enabled) {
-        // we/ce/cs haven't resolved to their enabling values yet this pass (or this
-        // pulse genuinely isn't a write) - don't burn the edge, try again next
-        // iteration once they've settled; harmless if they really do stay disabled.
-        holdEdgeOpen(meta);
-      } else {
-        const dinBits = inputs.din || new Array(dataWidth).fill(FLOATING);
-        const v = toInt(dinBits);
-        if (v === null) {
-          // din (or addr) not settled yet this pass - try again next iteration
-          // instead of permanently losing this write.
-          holdEdgeOpen(meta);
-        } else if (!stableAcrossIterations(v, state, meta, callId, 'din')) {
-          // din is non-floating but may be a stale value from before this call
-          // (e.g. an upstream mux mid-reconverging) - confirm it repeats first.
-          holdEdgeOpen(meta);
-        } else {
-          mem = mem.slice();
-          mem[addr % size] = v;
-        }
+    const rising = risingEdge(state, clk);
+    if (rising && we === 1 && enabled) {
+      const dinBits = inputs.din || new Array(dataWidth).fill(FLOATING);
+      const v = toInt(dinBits);
+      if (v !== null) {
+        mem = mem.slice();
+        mem[addr % size] = v;
       }
     }
     const out = mem[addr % size] ?? 0;
     const dout = enabled ? fromInt(out, dataWidth) : new Array(dataWidth).fill(FLOATING);
-    return { outputs: { dout }, state: { mem, ...meta } };
+    return { outputs: { dout }, state: { mem, prevClk: clk } };
   },
   help: {
     summary: 'RAM: adressierter, beschreib- und lesbarer Speicher (wie ein SRAM-Baustein), Inhalt bleibt bis zum Reset/Neuladen erhalten.',
@@ -513,8 +360,9 @@ registerComponentType({
     { id: 'tc', label: 'TC', dir: 'out', width: 1, side: 'right', order: 1 },
   ],
   size: () => ({ w: 4, h: 5 }),
+  isSequential: true,
   init: () => ({ value: 0, prevClk: 0 }),
-  evaluate: ({ inputs, state, params, callStartState, callId }) => {
+  evaluate: ({ inputs, state, params }) => {
     const width = params.width ?? 8;
     const max = 2 ** width;
     const clk = ctrl(inputs.clk?.[0], 0);
@@ -522,18 +370,14 @@ registerComponentType({
     const rst = ctrl(inputs.rst?.[0], 0);
     const dir = ctrl(inputs.dir?.[0], 1);
     let value = state.value ?? 0;
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
+    const rising = risingEdge(state, clk);
     if (rst === 1) {
       value = 0;
-    } else if (rising) {
-      if (en !== 1) {
-        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
-      } else {
-        value = dir === 1 ? (value + 1) % max : (value - 1 + max) % max;
-      }
+    } else if (rising && en === 1) {
+      value = dir === 1 ? (value + 1) % max : (value - 1 + max) % max;
     }
     const tc = dir === 1 ? (value === max - 1 ? 1 : 0) : (value === 0 ? 1 : 0);
-    return { outputs: { q: fromInt(value, width), tc: [tc] }, state: { value, ...meta } };
+    return { outputs: { q: fromInt(value, width), tc: [tc] }, state: { value, prevClk: clk } };
   },
   help: {
     summary: 'Zähler: erhöht (oder verringert) seinen Wert bei jeder steigenden CLK-Flanke, mit Überlauf/Wrap-around.',
@@ -562,8 +406,9 @@ registerComponentType({
     { id: 'sout', label: 'SOUT', dir: 'out', width: 1, side: 'right', order: 1 },
   ],
   size: () => ({ w: 4, h: 6 }),
+  isSequential: true,
   init: () => ({ value: 0, prevClk: 0 }),
-  evaluate: ({ inputs, state, params, callStartState, callId }) => {
+  evaluate: ({ inputs, state, params }) => {
     const width = params.width ?? 8;
     const dir = params.direction ?? 'left';
     const clk = ctrl(inputs.clk?.[0], 0);
@@ -573,27 +418,15 @@ registerComponentType({
     const sin = ctrl(inputs.sin?.[0], 0);
     let value = state.value ?? 0;
     let soutBit = dir === 'left' ? (value >> (width - 1)) & 1 : value & 1;
-    const { rising, meta } = consumeRisingEdge(state, callStartState, clk, callId);
+    const rising = risingEdge(state, clk);
     const mask = width >= 31 ? 0xFFFFFFFF : (2 ** width - 1);
     if (rst === 1) {
       value = 0;
-    } else if (rising) {
-      if (en !== 1) {
-        holdEdgeOpen(meta); // en not resolved to 1 yet this pass - try again next iteration
-      } else if (ld === 1) {
+    } else if (rising && en === 1) {
+      if (ld === 1) {
         const dBits = inputs.d || new Array(width).fill(FLOATING);
         const v = toInt(dBits);
-        if (v === null) {
-          // d not settled yet this pass - try again next iteration instead of
-          // permanently losing this load.
-          holdEdgeOpen(meta);
-        } else if (!stableAcrossIterations(v, state, meta, callId, 'd')) {
-          // d is non-floating but may be a stale value from before this call
-          // (e.g. an upstream mux mid-reconverging) - confirm it repeats first.
-          holdEdgeOpen(meta);
-        } else {
-          value = v;
-        }
+        if (v !== null) value = v;
       } else if (dir === 'left') {
         soutBit = (value >> (width - 1)) & 1;
         value = ((value << 1) | (sin ? 1 : 0)) & mask;
@@ -602,7 +435,7 @@ registerComponentType({
         value = ((value >>> 1) | ((sin ? 1 : 0) << (width - 1))) & mask;
       }
     }
-    return { outputs: { q: fromInt(value, width), sout: [soutBit] }, state: { value, ...meta } };
+    return { outputs: { q: fromInt(value, width), sout: [soutBit] }, state: { value, prevClk: clk } };
   },
   help: {
     summary: 'Schieberegister: schiebt seinen Inhalt bei jeder steigenden CLK-Flanke um 1 Bit (links oder rechts), oder lädt bei LD=1 einen kompletten Wert parallel.',
