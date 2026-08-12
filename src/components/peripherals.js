@@ -138,6 +138,7 @@ registerComponentType({
     w: Math.max(6, Math.min(30, (params.cols ?? 40) * 0.32 + 2)),
     h: Math.max(4, Math.min(22, (params.rows ?? 12) * 0.48 + 2)),
   }),
+  isSequential: true,
   init: () => ({ lines: [''], cursorCol: 0, prevClk: 0, pendingKey: 0, strobe: false }),
   interactive: true,
   // Tastatureingabe (Punkt 1: "Schreiben im Terminal"): das Bauteil auswählen und
@@ -250,6 +251,7 @@ registerComponentType({
     { id: 'rst', label: 'R', dir: 'in', width: 1, side: 'left', order: 4 },
   ],
   size: () => ({ w: 8, h: 8 }),
+  isSequential: true,
   init: (params) => ({ fb: new Array(pixelCount(params).n).fill(0), prevClk: 0 }),
   evaluate: ({ inputs, state, params }) => {
     const { cols, rows, n } = pixelCount(params);
