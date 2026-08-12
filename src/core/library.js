@@ -51,6 +51,33 @@ function pinInputsKey(def, forcedInputs) {
   return s;
 }
 
+// Does this circuit (or any composite nested inside it, arbitrarily deep) contain an
+// internal free-running clock (isClock, hz > 0)? Mirrors editor.js's
+// circuitHasActiveClock exactly - same question, same recursion into nested composite
+// sub-circuits, same seenTypes self-reference guard. This MUST recurse: a composite
+// component (e.g. a "CPU" built by grouping a "Clock Divider" sub-composite that itself
+// contains the raw CLOCK component two levels down) legitimately has an active clock
+// ticking on its own, even though no CLOCK instance appears directly in `components`.
+function hasActiveClockDeep(components, seenTypes = new Set()) {
+  for (const inst of components) {
+    const def = getComponentType(inst.type);
+    if (!def) continue;
+    if (def.isClock) {
+      if ((inst.params?.hz ?? 0) > 0) return true;
+      continue;
+    }
+    if (def.isComposite) {
+      if (seenTypes.has(inst.type)) continue;
+      seenTypes.add(inst.type);
+      const libDef = getDefinition(inst.type);
+      if (libDef?.kind === 'composite' && libDef.circuit?.components?.length) {
+        if (hasActiveClockDeep(libDef.circuit.components, seenTypes)) return true;
+      }
+    }
+  }
+  return false;
+}
+
 function buildCompositeType(def) {
   return {
     type: def.id,
@@ -68,10 +95,18 @@ function buildCompositeType(def) {
         sub = Circuit.fromPlain(sub && sub.components ? sub : def.circuit);
       }
       if (sub._lfHasActiveClock === undefined) {
-        sub._lfHasActiveClock = sub.components.some((inst) => {
-          const d = getComponentType(inst.type);
-          return d?.isClock && (inst.params?.hz ?? 0) > 0;
-        });
+        // Was previously a shallow `sub.components.some(...)` scan - only checked
+        // DIRECT children of this composite for isClock, missing a clock nested inside
+        // a sub-composite two-or-more levels down. That under-detection meant a
+        // composite with a genuinely free-running internal clock could get
+        // `canMemoize = true` below, letting the memoized-output shortcut skip calling
+        // settleCircuit(sub, ...) entirely on ticks where the composite's OWN boundary
+        // pins happened to look unchanged - even though internally, time was still
+        // supposed to be advancing and driving writes (RAM, framebuffers, ...) on its
+        // own schedule. The visible symptom is exactly "some writes silently never
+        // happen" (memory cells left at their default value) rather than any wrong
+        // value ever being written - matching hasActiveClockDeep's fix target.
+        sub._lfHasActiveClock = hasActiveClockDeep(sub.components);
       }
 
       const forcedInputs = {};
