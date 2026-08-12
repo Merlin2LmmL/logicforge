@@ -368,6 +368,45 @@ export class Editor {
       time: this.time,
     });
     if (this.placingType) this._drawGhost(ctx);
+    this._drawSimLagIndicator(ctx);
+  }
+
+  // Zeigt an, wenn die Simulation der angeforderten Taktfrequenz gerade hinterherhinkt
+  // (this._simDebtMs > 0, siehe _frame): ohne diesen Hinweis sieht ein noch nicht
+  // fertig "aufgeholtes" Frame optisch exakt so aus wie ein fertiges - z.B. ein
+  // Framebuffer, der mitten im Beschreiben steckt, wirkt dann wie ein fertiges (aber
+  // "falsches") Bild, obwohl er nur noch nicht alle Schreibzugriffe abbekommen hat.
+  // Hysterese (Ein-/Ausblend-Schwelle unterschiedlich) verhindert Geflacker, wenn das
+  // Sim-Debt knapp um die Schwelle pendelt.
+  _drawSimLagIndicator(ctx) {
+    const debt = this._simDebtMs || 0;
+    const SHOW_MS = 150, HIDE_MS = 30;
+    if (this._simLagVisible) {
+      if (debt < HIDE_MS) this._simLagVisible = false;
+    } else if (debt > SHOW_MS) {
+      this._simLagVisible = true;
+    }
+    if (!this._simLagVisible) return;
+
+    const label = `⏳ Simulation hinkt hinterher - ${(debt / 1000).toFixed(1)}s Rückstand, holt auf...`;
+    ctx.save();
+    ctx.font = '600 12px "JetBrains Mono", monospace';
+    const paddingX = 10, paddingY = 6;
+    const textW = ctx.measureText(label).width;
+    const boxW = textW + paddingX * 2, boxH = 22;
+    const x = (this._cssW - boxW) / 2, y = 10;
+    ctx.fillStyle = 'rgba(20, 14, 4, 0.88)';
+    ctx.strokeStyle = '#f0a35e';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y, boxW, boxH, 5); else ctx.rect(x, y, boxW, boxH);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#f0a35e';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, x + boxW / 2, y + boxH / 2 + 1);
+    ctx.restore();
   }
 
   _drawGhost(ctx) {
