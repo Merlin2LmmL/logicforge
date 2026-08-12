@@ -787,7 +787,7 @@ export class Editor {
           const inst = this.circuit.getComponent(id);
           if (inst) { inst.x = start.x + dx; inst.y = start.y + dy; }
         }
-        this._reflowWires(this.drag.startPositions);
+        this._reflowWires(this.drag.startPositions, dx, dy);
       }
       return;
     }
@@ -1092,7 +1092,18 @@ export class Editor {
   // Pin lagen, um denselben Versatz mit - automatische wie manuell gesetzte
   // Ecken gleichermaßen. Berechnung erfolgt jeden Frame neu ausgehend vom
   // Zustand bei Drag-Beginn (wireSnapshots), damit nichts kumulativ driftet.
-  _reflowWires(movedIds) {
+  //
+  // Sonderfall: hängen BEIDE Enden eines Kabels an bewegten Bauteilen (z.B. beim
+  // gemeinsamen Verschieben einer Mehrfachauswahl), bewegen sich Quelle und Ziel
+  // exakt um denselben Versatz (dx,dy). Die sonst genutzte Pin-Nahe-Heuristik
+  // verschiebt aber nur Zwischenpunkte, die zufällig exakt auf der alten x- oder
+  // y-Koordinate eines der beiden Pins lagen (TOL-Vergleich) - ein frei gesetzter
+  // Wegpunkt, der auf keiner der beiden Achsen liegt, würde dabei zurückbleiben
+  // und "aus dem Kabel herausgezogen" wirken, obwohl das ganze Bauteil-Paar sich
+  // gemeinsam bewegt. In diesem Fall daher das komplette Kabel (alle Wegpunkte)
+  // starr um denselben Versatz mitverschieben, statt die Pin-Nahe-Heuristik
+  // anzuwenden.
+  _reflowWires(movedIds, dx = 0, dy = 0) {
     const snapshots = this.drag?.wireSnapshots;
     const TOL = 0.05;
     for (const wire of this.circuit.wires) {
@@ -1105,6 +1116,11 @@ export class Editor {
       if (!src || !tgt) continue;
 
       const snap = snapshots?.get(wire.id);
+
+      if (movedIds.has(wire.from.compId) && movedIds.has(wire.to.compId)) {
+        wire.points = (snap ? snap.origPoints : wire.points).map((p) => ({ ...p, x: p.x + dx, y: p.y + dy }));
+        continue;
+      }
 
       if (!snap || snap.origPoints.length === 0) {
         if (this.orthoMode && Math.abs(src.x - tgt.x) > 0.01 && Math.abs(src.y - tgt.y) > 0.01) {
