@@ -237,8 +237,17 @@ registerComponentType({
     if (rising && we === 1 && enabled) {
       const dinBits = inputs.din || new Array(dataWidth).fill(FLOATING);
       const v = toInt(dinBits);
+      // Mutate the single written cell in place instead of `mem = mem.slice()`-ing
+      // the WHOLE array on every write. That copy was O(size) per write - for a
+      // screen-sized RAM (e.g. addrWidth 16 = 65536 words) a fast pixel-writing
+      // loop turned every single write into a 65536-element allocation+copy, which
+      // is what actually blew the per-frame simulation time budget in editor.js
+      // (_frame's budgetDeadline) long before the requested clock speed itself was
+      // a problem. No aliasing risk from mutating in place: undo/history already
+      // takes a fully independent deep clone of component state via
+      // model.js/cloneState (see Circuit.clone -> pushHistory), so nothing else
+      // expects this array to stay untouched between evaluate() calls.
       if (v !== null) {
-        mem = mem.slice();
         mem[addr % size] = v;
       }
     }
